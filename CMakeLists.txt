@@ -11,7 +11,9 @@ option(LOB_BUILD_TESTS "Build unit and differential tests" ON)
 option(LOB_BUILD_BENCH "Build benchmarks" OFF)
 
 # The engine is header-only: an INTERFACE target carries the include path and flags.
-add_library(lob INTERFACE)
+add_library(lob INTERFACE
+        include/lob/types.h
+        include/lob/commands.h)
 add_library(lob::lob ALIAS lob)
 target_include_directories(lob INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(lob INTERFACE cxx_std_20)
@@ -19,7 +21,7 @@ target_compile_features(lob INTERFACE cxx_std_20)
 # Warnings for everything we compile ourselves (not for fetched dependencies).
 add_library(lob_warnings INTERFACE)
 target_compile_options(lob_warnings INTERFACE
-  -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Wold-style-cast)
+  -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Wold-style-cast -Werror)
 
 if(LOB_SANITIZE)
   add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
