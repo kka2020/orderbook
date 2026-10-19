@@ -13,7 +13,8 @@ option(LOB_BUILD_BENCH "Build benchmarks" OFF)
 # The engine is header-only: an INTERFACE target carries the include path and flags.
 add_library(lob INTERFACE
         include/lob/types.h
-        include/lob/commands.h)
+        include/lob/commands.h
+        include/lob/baseline.h)
 add_library(lob::lob ALIAS lob)
 target_include_directories(lob INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(lob INTERFACE cxx_std_20)
