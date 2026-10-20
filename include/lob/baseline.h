@@ -17,11 +17,19 @@ namespace lob {
     class BaselineBook {
     public:
         [[nodiscard]] std::optional<Price> best_bid() const {
-            return get_best(bids);
+            return bids.get_best();
         }
 
         [[nodiscard]] std::optional<Price> best_ask() const {
-            return get_best(asks);
+            return asks.get_best();
+        }
+
+        [[nodiscard]] std::uint64_t depth_at(Price price, Side side) const {
+            if (side == Side::Buy) {
+                return bids.depth_at(price);
+            }
+
+            return asks.depth_at(price);
         }
 
         void apply(const Command &command) {
@@ -35,9 +43,9 @@ namespace lob {
             Order order = {.id = id, .qty = qty};
 
             if (side == Side::Buy) {
-                add_to(bids, price, order);
+                bids.add(price, order);
             } else {
-                add_to(asks, price, order);
+                asks.add(price, order);
             }
         }
     private:
@@ -46,24 +54,45 @@ namespace lob {
             Quantity qty;
         };
 
-        std::map<Price, std::list<Order>, std::greater<Price>> bids;
-        std::map<Price, std::list<Order>> asks;
+        template <Side S>
+        class BookSide {
+        public:
+            [[nodiscard]] std::optional<Price> get_best() const {
+                auto first_entry {levels.begin()};
+                if (first_entry == levels.end()) {
+                    return std::nullopt;
+                }
 
-        [[nodiscard]] std::optional<Price> get_best(const auto& book_side) const {
-            auto first_entry {book_side.begin()};
-            if (first_entry == book_side.end()) {
-                return std::nullopt;
+                return first_entry->first;
             }
 
-            return first_entry->first;
-        }
+            void add(Price price, Order order) {
+                auto [level_it, _] = levels.try_emplace(price);
+                auto& queue {level_it->second};
+                queue.push_back(order);
+            }
 
-        void add_to(auto& book_side, Price price, Order order) {
-            auto [level_it, _] = book_side.try_emplace(price);
-            auto& queue {level_it->second};
-            queue.push_back(order);
-        }
+            [[nodiscard]] std::uint64_t depth_at(Price price) const {
+                auto level_it {levels.find(price)};
+                if (level_it == levels.end()) {
+                    return 0;
+                }
 
+                const auto& orders {level_it->second};
+                std::uint64_t sum {0};
+                for (const auto& order : orders) {
+                    sum += order.qty.value;
+                }
+
+                return sum;
+            }
+        private:
+            using Compare = std::conditional_t<S == Side::Buy, std::greater<Price>, std::less<Price>>;
+            std::map<Price, std::list<Order>, Compare> levels;
+        };
+
+        BookSide<Side::Buy> bids;
+        BookSide<Side::Sell> asks;
     };
 }
 

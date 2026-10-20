@@ -4,9 +4,10 @@
 #include "lob/types.h"
 
 namespace lob::test {
-    inline NewOrder buy(OrderId id, Price price, Quantity qty) {
+
+    inline NewOrder new_order(Side side, OrderId id, Price price, Quantity qty) {
         return NewOrder {
-            .side = Side::Buy,
+            .side = side,
             .tif = TimeInForce::GTC,
             .qty = qty,
             .seq = SeqNo{1},
@@ -15,15 +16,16 @@ namespace lob::test {
         };
     }
 
+    inline NewOrder buy(OrderId id, Price price, Quantity qty) {
+        return new_order(Side::Buy, id, price, qty);
+    }
+
     inline NewOrder sell(OrderId id, Price price, Quantity qty) {
-        return NewOrder {
-            .side = Side::Sell,
-            .tif = TimeInForce::GTC,
-            .qty = qty,
-            .seq = SeqNo{1},
-            .id = id,
-            .price = price,
-        };
+        return new_order(Side::Sell, id, price, qty);
+    }
+
+    inline Side opposite(Side side) {
+        return side == Side::Buy ? Side::Sell : Side::Buy;
     }
 }
 
