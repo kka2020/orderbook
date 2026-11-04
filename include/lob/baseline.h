@@ -1,21 +1,23 @@
-//
-// Created by kavin on 18/10/2026.
-//
-
 #ifndef ORDERBOOK_BASELINE_H
 #define ORDERBOOK_BASELINE_H
 #include <list>
 #include <optional>
 #include <map>
 #include <functional>
+#include <algorithm>
+#include <type_traits>
 
 #include "types.h"
 #include "commands.h"
+#include "events.h"
 
 namespace lob {
 
+    template <typename Listener>
     class BaselineBook {
     public:
+        explicit BaselineBook(Listener& l) : listener {l} {}
+
         [[nodiscard]] std::optional<Price> best_bid() const {
             return bids.get_best();
         }
@@ -35,17 +37,30 @@ namespace lob {
         void apply(const Command &command) {
             NewOrder new_order {std::get<NewOrder>(command)};
 
-            OrderId id {new_order.id};
-            Side side {new_order.side};
-            Price price {new_order.price};
-            Quantity qty {new_order.qty};
+            listener.on(OrderAck{
+                .side = new_order.side,
+                .qty = new_order.qty,
+                .seq = new_order.seq,
+                .id = new_order.id,
+                .price = new_order.price
+            });
 
-            Order order = {.id = id, .qty = qty};
+            // Cross the opposite side
+            Quantity remaining_qty {
+                new_order.side == Side::Buy ? asks.cross(new_order, listener) : bids.cross(new_order, listener)
+            };
 
-            if (side == Side::Buy) {
-                bids.add(price, order);
+            // If there is not remaining quantity, we don't need to rest an order
+            if (remaining_qty.value == 0) {
+                return;
+            }
+
+            // Otherwise, we proceed to rest the order
+            Order order = {.id = new_order.id, .qty = remaining_qty};
+            if (new_order.side == Side::Buy) {
+                bids.add(new_order.price, order);
             } else {
-                asks.add(price, order);
+                asks.add(new_order.price, order);
             }
         }
     private:
@@ -86,11 +101,56 @@ namespace lob {
 
                 return sum;
             }
+
+            [[nodiscard]] Quantity cross(const NewOrder& taker, Listener& l) {
+                Quantity remaining_qty {taker.qty};
+                // Check that price still crosses this book
+                while (crosses(taker.price) && remaining_qty.value > 0) {
+                    // levels must be non-empty if taker price crosses, so this is safe
+                    auto level {levels.begin()};
+                    auto& [price, best_orders] = *level;
+
+                    // Consume orders until level runs out or taker runs out of qty
+                    while (!best_orders.empty() && remaining_qty.value > 0) {
+                        Order& maker {best_orders.front()};
+
+                        Quantity fill_size {std::min(maker.qty, remaining_qty)};
+
+                        maker.qty -= fill_size;
+                        remaining_qty -= fill_size;
+
+                        l.on(Trade{
+                            .qty = fill_size,
+                            .seq = taker.seq,
+                            .maker_id = maker.id,
+                            .taker_id = taker.id,
+                            .price = price,
+                        });
+
+                        if (maker.qty.value == 0) {
+                            best_orders.pop_front();
+                        }
+                    }
+
+                    // If level is now empty, delete it
+                    if (best_orders.empty()) {
+                        levels.erase(level);
+                    }
+                }
+
+                return remaining_qty;
+            }
         private:
+            [[nodiscard]] bool crosses(Price price) const {
+                std::optional best {get_best()};
+                return best.has_value() && !Compare{}(price, *best);
+            }
+
             using Compare = std::conditional_t<S == Side::Buy, std::greater<Price>, std::less<Price>>;
             std::map<Price, std::list<Order>, Compare> levels;
         };
 
+        Listener& listener;
         BookSide<Side::Buy> bids;
         BookSide<Side::Sell> asks;
     };

@@ -9,12 +9,18 @@ namespace lob {
         explicit constexpr Strong(Rep v) noexcept : value(v) {}
 
         constexpr auto operator<=>(const Strong&) const noexcept = default;
-
         Rep value;
     };
 
     using Price = Strong<struct PriceTag, std::int64_t>;
+
     using Quantity = Strong<struct QuantityTag, std::uint32_t>;
+
+    constexpr Quantity& operator-=(Quantity& x, Quantity y) noexcept {
+        x.value -= y.value;
+        return x;
+    }
+
     using OrderId = Strong<struct OrderIdTag, std::uint64_t>;
     using SeqNo = Strong<struct SeqNoTag, std::uint64_t>;
 

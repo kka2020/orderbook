@@ -1,3 +1,7 @@
+#include <cstdint>
+#include <limits>
+#include <vector>
+
 #include <gtest/gtest.h>
 
 #include "book_test_support.h"
@@ -5,22 +9,21 @@
 
 namespace lob::test {
     template <typename Book>
-    class RulesTest : public  ::testing::Test {
-    protected:
-        Book book;
-    };
+    class RulesTest : public BookTest<Book> {};
 
-    using BookTypes = ::testing::Types<BaselineBook>;
+    using BookTypes = ::testing::Types<BaselineBook<RecordingListener>>;
     TYPED_TEST_SUITE(RulesTest, BookTypes);
+
+    // ---- Resting orders and best bid/ask ----
 
     TYPED_TEST(RulesTest, BestBidIsNullOptWhenNoRestingBuys) {
         EXPECT_EQ(this->book.best_bid(), std::nullopt);
     }
 
     TYPED_TEST(RulesTest, BestBidIsHighestPriceAmongRestingBuys) {
-        this->book.apply(buy(OrderId{2}, Price{2}, Quantity{5}));
-        this->book.apply(buy(OrderId{1}, Price{3}, Quantity{5}));
-        this->book.apply(buy(OrderId{3}, Price{1}, Quantity{5}));
+        this->send(buy(OrderId{2}, Price{2}, Quantity{5}));
+        this->send(buy(OrderId{1}, Price{3}, Quantity{5}));
+        this->send(buy(OrderId{3}, Price{1}, Quantity{5}));
 
         EXPECT_EQ(this->book.best_bid(), Price{3});
     }
@@ -30,12 +33,176 @@ namespace lob::test {
     }
 
     TYPED_TEST(RulesTest, BestAskIsLowestPriceAmongRestingSells) {
-        this->book.apply(sell(OrderId{2}, Price{2}, Quantity{5}));
-        this->book.apply(sell(OrderId{3}, Price{1}, Quantity{5}));
-        this->book.apply(sell(OrderId{1}, Price{3}, Quantity{5}));
+        this->send(sell(OrderId{2}, Price{2}, Quantity{5}));
+        this->send(sell(OrderId{3}, Price{1}, Quantity{5}));
+        this->send(sell(OrderId{1}, Price{3}, Quantity{5}));
 
         EXPECT_EQ(this->book.best_ask(), Price{1});
     }
+
+    // ---- Acknowledgements ----
+
+    TYPED_TEST(RulesTest, NewOrderIsAcknowledgedWithItsOwnFields) {
+        SeqNo seq = this->send(buy(OrderId{10}, Price{50}, Quantity{7}));
+
+        std::vector<Event> expected {
+            OrderAck{.side = Side::Buy, .qty = Quantity{7}, .seq = seq, .id = OrderId{10}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->listener.events, expected);
+    }
+
+    TYPED_TEST(RulesTest, NonCrossingOrdersRestWithoutTrading) {
+        this->send(buy(OrderId{10}, Price{49}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{50}, Quantity{5}));
+
+        EXPECT_TRUE(this->trades().empty());
+        EXPECT_EQ(this->book.best_bid(), Price{49});
+        EXPECT_EQ(this->book.best_ask(), Price{50});
+    }
+
+    // ---- Crossing: a trade happens when buy price >= sell price ----
+
+    TYPED_TEST(RulesTest, BuyAtAskPriceTradesFully) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{10}));
+        SeqNo taker = this->send(buy(OrderId{20}, Price{50}, Quantity{10}));
+
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{10}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{20}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, SellAtBidPriceTradesFully) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{10}));
+        SeqNo taker = this->send(sell(OrderId{20}, Price{50}, Quantity{10}));
+
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{10}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{20}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, AggressiveBuyFillsAtMakerPrice) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{10}));
+        this->send(buy(OrderId{20}, Price{52}, Quantity{10}));
+
+        ASSERT_EQ(this->trades().size(), 1u);
+        EXPECT_EQ(this->trades()[0].price, Price{50});
+    }
+
+    TYPED_TEST(RulesTest, AggressiveSellFillsAtMakerPrice) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{10}));
+        this->send(sell(OrderId{20}, Price{48}, Quantity{10}));
+
+        ASSERT_EQ(this->trades().size(), 1u);
+        EXPECT_EQ(this->trades()[0].price, Price{50});
+    }
+
+    TYPED_TEST(RulesTest, OrderAckComesBeforeTheTradesItCauses) {
+        SeqNo maker = this->send(sell(OrderId{10}, Price{50}, Quantity{10}));
+        SeqNo taker = this->send(buy(OrderId{20}, Price{51}, Quantity{10}));
+
+        std::vector<Event> expected {
+            OrderAck{.side = Side::Sell, .qty = Quantity{10}, .seq = maker, .id = OrderId{10}, .price = Price{50}},
+            OrderAck{.side = Side::Buy, .qty = Quantity{10}, .seq = taker, .id = OrderId{20}, .price = Price{51}},
+            Trade{.qty = Quantity{10}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{20}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->listener.events, expected);
+    }
+
+    // ---- Partial fills ----
+
+    TYPED_TEST(RulesTest, PartialFillLeavesMakerRemainderResting) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{100}));
+        SeqNo taker = this->send(buy(OrderId{20}, Price{51}, Quantity{60}));
+
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{60}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{20}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->book.best_ask(), Price{50});
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Sell), 40u);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, PartialFillRestsTakerRemainderAtItsOwnPrice) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{40}));
+        SeqNo taker = this->send(buy(OrderId{20}, Price{51}, Quantity{100}));
+
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{40}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{20}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+        EXPECT_EQ(this->book.best_bid(), Price{51});
+        EXPECT_EQ(this->book.depth_at(Price{51}, Side::Buy), 60u);
+    }
+
+    // ---- Priority: better price first, then earlier arrival ----
+
+    TYPED_TEST(RulesTest, BetterPriceFillsFirstEvenIfItArrivedLater) {
+        this->send(sell(OrderId{10}, Price{51}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{50}, Quantity{5}));
+        this->send(buy(OrderId{30}, Price{51}, Quantity{5}));
+
+        ASSERT_EQ(this->trades().size(), 1u);
+        EXPECT_EQ(this->trades()[0].maker_id, OrderId{20});
+        EXPECT_EQ(this->trades()[0].price, Price{50});
+        EXPECT_EQ(this->book.best_ask(), Price{51});
+    }
+
+    TYPED_TEST(RulesTest, EarlierOrderAtSamePriceFillsFirst) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{50}, Quantity{5}));
+        this->send(buy(OrderId{30}, Price{50}, Quantity{5}));
+
+        ASSERT_EQ(this->trades().size(), 1u);
+        EXPECT_EQ(this->trades()[0].maker_id, OrderId{10});
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Sell), 5u);
+    }
+
+    TYPED_TEST(RulesTest, TakerWalksTheQueueAtOnePriceInArrivalOrder) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{3}));
+        this->send(sell(OrderId{20}, Price{50}, Quantity{4}));
+        this->send(sell(OrderId{30}, Price{50}, Quantity{5}));
+        SeqNo taker = this->send(buy(OrderId{40}, Price{50}, Quantity{10}));
+
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{3}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{40}, .price = Price{50}},
+            Trade{.qty = Quantity{4}, .seq = taker, .maker_id = OrderId{20}, .taker_id = OrderId{40}, .price = Price{50}},
+            Trade{.qty = Quantity{3}, .seq = taker, .maker_id = OrderId{30}, .taker_id = OrderId{40}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Sell), 2u);
+    }
+
+    // ---- Cleanup: filled orders and emptied levels must disappear ----
+
+    TYPED_TEST(RulesTest, FullyFilledMakerIsRemovedFromItsQueue) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{50}, Quantity{5}));
+        this->send(buy(OrderId{30}, Price{50}, Quantity{5}));
+        this->send(buy(OrderId{40}, Price{50}, Quantity{5}));
+
+        ASSERT_EQ(this->trades().size(), 2u);
+        EXPECT_EQ(this->trades()[1].maker_id, OrderId{20});
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, EmptiedLevelIsRemovedSoNextLevelBecomesBest) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{51}, Quantity{5}));
+        this->send(buy(OrderId{30}, Price{50}, Quantity{5}));
+
+        EXPECT_EQ(this->book.best_ask(), Price{51});
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Sell), 0u);
+    }
+
+    // ---- depth_at, run once per side ----
 
     template <typename BookT, Side s>
     struct OnSide {
@@ -44,51 +211,66 @@ namespace lob::test {
     };
 
     template <typename T>
-    class SidedRulesTest : public ::testing::Test {
+    class SidedRulesTest : public BookTest<typename T::Book> {
     protected:
-        T::Book book;
         static constexpr Side side = T::side;
     };
 
-    struct BaselineBuy : OnSide<BaselineBook, Side::Buy> {};
-    struct BaselineSell : OnSide<BaselineBook, Side::Sell> {};
+    struct BaselineBuy : OnSide<BaselineBook<RecordingListener>, Side::Buy> {};
+    struct BaselineSell : OnSide<BaselineBook<RecordingListener>, Side::Sell> {};
 
-    using SidedBookTypes = ::testing::Types<BaselineBuy,BaselineSell>;
+    using SidedBookTypes = ::testing::Types<BaselineBuy, BaselineSell>;
 
     TYPED_TEST_SUITE(SidedRulesTest, SidedBookTypes);
 
-    TYPED_TEST(SidedRulesTest, DepthAtIsZeroForEmptyPriceLevel) {
+    TYPED_TEST(SidedRulesTest, DepthAtIsZeroOnEmptyBook) {
         EXPECT_EQ(this->book.depth_at(Price{0}, this->side), 0);
     }
 
+    TYPED_TEST(SidedRulesTest, DepthAtIsZeroForMissingPriceLevel) {
+        this->send(new_order(this->side, OrderId{1}, Price{0}, Quantity{5}));
+        this->send(new_order(this->side, OrderId{2}, Price{1}, Quantity{5}));
+
+        EXPECT_EQ(this->book.depth_at(Price{2}, this->side), 0);
+    }
+
     TYPED_TEST(SidedRulesTest, DepthAtIsSumOfQuantitiesAtPriceLevel) {
-        this->book.apply(new_order(this->side, OrderId{1}, Price{0}, Quantity{5}));
-        this->book.apply(new_order(this->side, OrderId{2}, Price{0}, Quantity{10}));
-        this->book.apply(new_order(this->side, OrderId{3}, Price{0}, Quantity{15}));
+        this->send(new_order(this->side, OrderId{1}, Price{0}, Quantity{5}));
+        this->send(new_order(this->side, OrderId{2}, Price{0}, Quantity{10}));
+        this->send(new_order(this->side, OrderId{3}, Price{0}, Quantity{15}));
 
         EXPECT_EQ(this->book.depth_at(Price{0}, this->side), 5 + 10 + 15);
     }
 
     TYPED_TEST(SidedRulesTest, DepthAtIgnoresOtherPriceLevels) {
-        this->book.apply(new_order(this->side, OrderId{1}, Price{0}, Quantity{5}));
+        this->send(new_order(this->side, OrderId{1}, Price{0}, Quantity{5}));
 
-        this->book.apply(new_order(this->side, OrderId{2}, Price{1}, Quantity{5}));
-        this->book.apply(new_order(this->side, OrderId{3}, Price{1}, Quantity{10}));
+        this->send(new_order(this->side, OrderId{2}, Price{1}, Quantity{10}));
+        this->send(new_order(this->side, OrderId{3}, Price{2}, Quantity{15}));
 
-        EXPECT_EQ(this->book.depth_at(Price{0}, this->side), 5);
+        EXPECT_EQ(this->book.depth_at(Price{1}, this->side), 10);
     }
 
     TYPED_TEST(SidedRulesTest, DepthAtIgnoresOppositeSide) {
-        this->book.apply(new_order(this->side, OrderId{1}, Price{5}, Quantity{5}));
+        this->send(new_order(this->side, OrderId{1}, Price{5}, Quantity{5}));
 
         Side other_side = opposite(this->side);
 
         // Rest the opposite side away from ours (bids below asks) so the book never crosses
         Price other_price = this->side == Side::Buy ? Price{10} : Price{0};
 
-        this->book.apply(new_order(other_side, OrderId{2}, other_price, Quantity{5}));
-        this->book.apply(new_order(other_side, OrderId{3}, other_price, Quantity{10}));
+        this->send(new_order(other_side, OrderId{2}, other_price, Quantity{5}));
+        this->send(new_order(other_side, OrderId{3}, other_price, Quantity{10}));
 
         EXPECT_EQ(this->book.depth_at(other_price, this->side), 0);
+    }
+
+    TYPED_TEST(SidedRulesTest, DepthAtCanGoPastUINT32MAX) {
+        Quantity quantity {std::numeric_limits<std::uint32_t>::max()};
+        this->send(new_order(this->side, OrderId{1}, Price{0}, quantity));
+        this->send(new_order(this->side, OrderId{2}, Price{0}, quantity));
+
+        // Widen before multiplying: 2u * UINT32_MAX is computed in 32 bits and wraps to 4294967294.
+        EXPECT_EQ(this->book.depth_at(Price{0}, this->side), std::uint64_t{2} * UINT32_MAX);
     }
 }
