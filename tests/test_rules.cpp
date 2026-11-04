@@ -202,6 +202,118 @@ namespace lob::test {
         EXPECT_EQ(this->book.depth_at(Price{50}, Side::Sell), 0u);
     }
 
+    // ---- Multi-level sweeps: one taker eats several levels, best first, up to its limit ----
+
+    TYPED_TEST(RulesTest, BuySweepsAskLevelsFromLowestUp) {
+        // Inserted out of price order, so the sweep order must come from price, not arrival
+        this->send(sell(OrderId{10}, Price{52}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{50}, Quantity{5}));
+        this->send(sell(OrderId{30}, Price{51}, Quantity{5}));
+        SeqNo taker = this->send(buy(OrderId{40}, Price{52}, Quantity{15}));
+
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{20}, .taker_id = OrderId{40}, .price = Price{50}},
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{30}, .taker_id = OrderId{40}, .price = Price{51}},
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{40}, .price = Price{52}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, SellSweepsBidLevelsFromHighestDown) {
+        this->send(buy(OrderId{10}, Price{48}, Quantity{5}));
+        this->send(buy(OrderId{20}, Price{50}, Quantity{5}));
+        this->send(buy(OrderId{30}, Price{49}, Quantity{5}));
+        SeqNo taker = this->send(sell(OrderId{40}, Price{48}, Quantity{15}));
+
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{20}, .taker_id = OrderId{40}, .price = Price{50}},
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{30}, .taker_id = OrderId{40}, .price = Price{49}},
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{40}, .price = Price{48}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, BuySweepStopsAtItsLimitAndRestsTheRemainder) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{51}, Quantity{5}));
+        this->send(sell(OrderId{30}, Price{53}, Quantity{5}));
+        SeqNo taker = this->send(buy(OrderId{40}, Price{52}, Quantity{20}));
+
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{40}, .price = Price{50}},
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{20}, .taker_id = OrderId{40}, .price = Price{51}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->book.best_ask(), Price{53});
+        EXPECT_EQ(this->book.depth_at(Price{53}, Side::Sell), 5u);
+        EXPECT_EQ(this->book.best_bid(), Price{52});
+        EXPECT_EQ(this->book.depth_at(Price{52}, Side::Buy), 10u);
+    }
+
+    TYPED_TEST(RulesTest, SellSweepStopsAtItsLimitAndRestsTheRemainder) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(buy(OrderId{20}, Price{49}, Quantity{5}));
+        this->send(buy(OrderId{30}, Price{47}, Quantity{5}));
+        SeqNo taker = this->send(sell(OrderId{40}, Price{48}, Quantity{20}));
+
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{40}, .price = Price{50}},
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{20}, .taker_id = OrderId{40}, .price = Price{49}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->book.best_bid(), Price{47});
+        EXPECT_EQ(this->book.depth_at(Price{47}, Side::Buy), 5u);
+        EXPECT_EQ(this->book.best_ask(), Price{48});
+        EXPECT_EQ(this->book.depth_at(Price{48}, Side::Sell), 10u);
+    }
+
+    TYPED_TEST(RulesTest, SweepEndingMidLevelLeavesThatMakerPartlyFilled) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{51}, Quantity{10}));
+        SeqNo taker = this->send(buy(OrderId{30}, Price{51}, Quantity{8}));
+
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{30}, .price = Price{50}},
+            Trade{.qty = Quantity{3}, .seq = taker, .maker_id = OrderId{20}, .taker_id = OrderId{30}, .price = Price{51}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->book.best_ask(), Price{51});
+        EXPECT_EQ(this->book.depth_at(Price{51}, Side::Sell), 7u);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, SweepKeepsTimePriorityWithinEachLevel) {
+        this->send(sell(OrderId{10}, Price{51}, Quantity{2}));
+        this->send(sell(OrderId{20}, Price{50}, Quantity{2}));
+        this->send(sell(OrderId{30}, Price{51}, Quantity{2}));
+        this->send(sell(OrderId{40}, Price{50}, Quantity{2}));
+        SeqNo taker = this->send(buy(OrderId{50}, Price{51}, Quantity{7}));
+
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{2}, .seq = taker, .maker_id = OrderId{20}, .taker_id = OrderId{50}, .price = Price{50}},
+            Trade{.qty = Quantity{2}, .seq = taker, .maker_id = OrderId{40}, .taker_id = OrderId{50}, .price = Price{50}},
+            Trade{.qty = Quantity{2}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{50}, .price = Price{51}},
+            Trade{.qty = Quantity{1}, .seq = taker, .maker_id = OrderId{30}, .taker_id = OrderId{50}, .price = Price{51}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->book.depth_at(Price{51}, Side::Sell), 1u);
+    }
+
+    TYPED_TEST(RulesTest, SweepThatClearsTheWholeSideRestsTheRemainder) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{51}, Quantity{5}));
+        this->send(buy(OrderId{30}, Price{55}, Quantity{12}));
+
+        EXPECT_EQ(this->trades().size(), 2u);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+        EXPECT_EQ(this->book.best_bid(), Price{55});
+        EXPECT_EQ(this->book.depth_at(Price{55}, Side::Buy), 2u);
+    }
+
     // ---- depth_at, run once per side ----
 
     template <typename BookT, Side s>
