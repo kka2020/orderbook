@@ -34,14 +34,21 @@ namespace lob {
             << " taker=" << e.taker_id.value << " price=" << e.price.value
             << " qty=" << e.qty.value << "}";
     }
+
+    inline void PrintTo(const CancelAck& e, std::ostream* os) {
+        *os << "CancelAck{seq=" << e.seq.value << " id=" << e.id.value
+            << " side=" << (e.side == Side::Buy ? "Buy" : "Sell")
+            << " price=" << e.price.value << " qty=" << e.qty.value << "}";
+    }
 }
 
 namespace lob::test {
 
-    inline NewOrder new_order(Side side, OrderId id, Price price, Quantity qty) {
+    inline NewOrder new_order(Side side, OrderId id, Price price, Quantity qty,
+                              TimeInForce tif = TimeInForce::GTC) {
         return NewOrder {
             .side = side,
-            .tif = TimeInForce::GTC,
+            .tif = tif,
             .qty = qty,
             .seq = SeqNo{1},
             .id = id,
@@ -57,19 +64,37 @@ namespace lob::test {
         return new_order(Side::Sell, id, price, qty);
     }
 
+    inline NewOrder ioc_buy(OrderId id, Price price, Quantity qty) {
+        return new_order(Side::Buy, id, price, qty, TimeInForce::IOC);
+    }
+
+    inline NewOrder ioc_sell(OrderId id, Price price, Quantity qty) {
+        return new_order(Side::Sell, id, price, qty, TimeInForce::IOC);
+    }
+
+    // Market orders are sent with price 0; the book must ignore it.
+    inline NewOrder market_buy(OrderId id, Quantity qty) {
+        return new_order(Side::Buy, id, Price{0}, qty, TimeInForce::Market);
+    }
+
+    inline NewOrder market_sell(OrderId id, Quantity qty) {
+        return new_order(Side::Sell, id, Price{0}, qty, TimeInForce::Market);
+    }
+
     inline Side opposite(Side side) {
         return side == Side::Buy ? Side::Sell : Side::Buy;
     }
 
     // Everything the book can emit, in emission order. One overload of on() per event type,
     // so the listener interface the book must call is spelled out here.
-    using Event = std::variant<OrderAck, Trade>;
+    using Event = std::variant<OrderAck, Trade, CancelAck>;
 
     struct RecordingListener {
         std::vector<Event> events;
 
         void on(const OrderAck& e) { events.emplace_back(e); }
         void on(const Trade& e) { events.emplace_back(e); }
+        void on(const CancelAck& e) { events.emplace_back(e); }
     };
 
     // Shared fixture: a book wired to a RecordingListener.
@@ -88,15 +113,20 @@ namespace lob::test {
             return order.seq;
         }
 
-        [[nodiscard]] std::vector<Trade> trades() const {
-            std::vector<Trade> out;
+        // All recorded events of one type, in emission order.
+        template <typename E>
+        [[nodiscard]] std::vector<E> events_of() const {
+            std::vector<E> out;
             for (const auto& e : listener.events) {
-                if (const auto* t = std::get_if<Trade>(&e)) {
-                    out.push_back(*t);
+                if (const auto* match = std::get_if<E>(&e)) {
+                    out.push_back(*match);
                 }
             }
             return out;
         }
+
+        [[nodiscard]] std::vector<Trade> trades() const { return events_of<Trade>(); }
+        [[nodiscard]] std::vector<CancelAck> cancel_acks() const { return events_of<CancelAck>(); }
 
     private:
         std::uint64_t next_seq_ {1};

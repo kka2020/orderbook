@@ -25,7 +25,33 @@ namespace lob {
     using SeqNo = Strong<struct SeqNoTag, std::uint64_t>;
 
     enum class Side : std::uint8_t { Buy, Sell };
-    enum class TimeInForce: std::uint8_t { GTC, IOC };
+    // GTC: rests until filled or cancelled. IOC: trades what it can now, the rest is cancelled.
+    // Market: like IOC, but with no limit price (its price field is ignored).
+    enum class TimeInForce: std::uint8_t { GTC, IOC, Market };
+
+    [[nodiscard]] constexpr bool rests(TimeInForce tif) {
+        switch (tif) {
+            case TimeInForce::GTC:
+                return true;
+            case TimeInForce::IOC:
+            case TimeInForce::Market:
+                return false;
+        }
+
+        __builtin_unreachable();
+    }
+
+    [[nodiscard]] constexpr bool is_market(TimeInForce tif) {
+        switch (tif) {
+            case TimeInForce::GTC:
+            case TimeInForce::IOC:
+                return false;
+            case TimeInForce::Market:
+                return true;
+        }
+
+        __builtin_unreachable();
+    }
 }
 
 #endif //ORDERBOOK_TYPES_H

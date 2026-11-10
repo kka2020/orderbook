@@ -314,6 +314,137 @@ namespace lob::test {
         EXPECT_EQ(this->book.depth_at(Price{55}, Side::Buy), 2u);
     }
 
+    // ---- IOC: trade what crosses now, cancel the rest (never rests) ----
+
+    TYPED_TEST(RulesTest, IocFullyFilledEmitsNoCancelAck) {
+        SeqNo maker = this->send(sell(OrderId{10}, Price{50}, Quantity{10}));
+        SeqNo taker = this->send(ioc_buy(OrderId{20}, Price{50}, Quantity{10}));
+
+        std::vector<Event> expected {
+            OrderAck{.side = Side::Sell, .qty = Quantity{10}, .seq = maker, .id = OrderId{10}, .price = Price{50}},
+            OrderAck{.side = Side::Buy, .qty = Quantity{10}, .seq = taker, .id = OrderId{20}, .price = Price{50}},
+            Trade{.qty = Quantity{10}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{20}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->listener.events, expected);
+    }
+
+    TYPED_TEST(RulesTest, IocPartialFillCancelsTheRemainderAfterItsTrades) {
+        SeqNo maker = this->send(sell(OrderId{10}, Price{50}, Quantity{4}));
+        SeqNo taker = this->send(ioc_buy(OrderId{20}, Price{51}, Quantity{10}));
+
+        std::vector<Event> expected {
+            OrderAck{.side = Side::Sell, .qty = Quantity{4}, .seq = maker, .id = OrderId{10}, .price = Price{50}},
+            OrderAck{.side = Side::Buy, .qty = Quantity{10}, .seq = taker, .id = OrderId{20}, .price = Price{51}},
+            Trade{.qty = Quantity{4}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{20}, .price = Price{50}},
+            CancelAck{.side = Side::Buy, .qty = Quantity{6}, .seq = taker, .id = OrderId{20}, .price = Price{51}},
+        };
+        EXPECT_EQ(this->listener.events, expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, IocSellPartialFillCancelsTheRemainder) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        SeqNo taker = this->send(ioc_sell(OrderId{20}, Price{50}, Quantity{8}));
+
+        std::vector<CancelAck> expected {
+            CancelAck{.side = Side::Sell, .qty = Quantity{3}, .seq = taker, .id = OrderId{20}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->trades().size(), 1u);
+        EXPECT_EQ(this->cancel_acks(), expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, IocThatDoesNotCrossIsCancelledInFull) {
+        this->send(sell(OrderId{10}, Price{52}, Quantity{5}));
+        SeqNo taker = this->send(ioc_buy(OrderId{20}, Price{50}, Quantity{10}));
+
+        std::vector<CancelAck> expected {
+            CancelAck{.side = Side::Buy, .qty = Quantity{10}, .seq = taker, .id = OrderId{20}, .price = Price{50}},
+        };
+        EXPECT_TRUE(this->trades().empty());
+        EXPECT_EQ(this->cancel_acks(), expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+        EXPECT_EQ(this->book.best_ask(), Price{52});
+        EXPECT_EQ(this->book.depth_at(Price{52}, Side::Sell), 5u);
+    }
+
+    TYPED_TEST(RulesTest, IocSweepStopsAtItsLimitAndCancelsTheRest) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{52}, Quantity{5}));
+        SeqNo taker = this->send(ioc_buy(OrderId{30}, Price{51}, Quantity{10}));
+
+        std::vector<CancelAck> expected {
+            CancelAck{.side = Side::Buy, .qty = Quantity{5}, .seq = taker, .id = OrderId{30}, .price = Price{51}},
+        };
+        ASSERT_EQ(this->trades().size(), 1u);
+        EXPECT_EQ(this->trades()[0].maker_id, OrderId{10});
+        EXPECT_EQ(this->cancel_acks(), expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+        EXPECT_EQ(this->book.best_ask(), Price{52});
+    }
+
+    // ---- Market: like IOC, but with no limit price (the price field is ignored) ----
+
+    TYPED_TEST(RulesTest, MarketBuySweepsEveryLevelWhateverThePrice) {
+        // The market order is sent with price 0; as a limit buy it would cross nothing
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{60}, Quantity{5}));
+        this->send(sell(OrderId{30}, Price{1000}, Quantity{5}));
+        SeqNo taker = this->send(market_buy(OrderId{40}, Quantity{15}));
+
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{40}, .price = Price{50}},
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{20}, .taker_id = OrderId{40}, .price = Price{60}},
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{30}, .taker_id = OrderId{40}, .price = Price{1000}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_TRUE(this->cancel_acks().empty());
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, MarketSellIgnoresItsPriceField) {
+        // As a limit sell at 100 this would not cross the bid at 50
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        SeqNo taker = this->send(new_order(Side::Sell, OrderId{20}, Price{100}, Quantity{5}, TimeInForce::Market));
+
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{20}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, MarketRemainderIsCancelledNotRested) {
+        SeqNo maker = this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        SeqNo taker = this->send(market_buy(OrderId{20}, Quantity{8}));
+
+        std::vector<Event> expected {
+            OrderAck{.side = Side::Sell, .qty = Quantity{5}, .seq = maker, .id = OrderId{10}, .price = Price{50}},
+            OrderAck{.side = Side::Buy, .qty = Quantity{8}, .seq = taker, .id = OrderId{20}, .price = Price{0}},
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{20}, .price = Price{50}},
+            CancelAck{.side = Side::Buy, .qty = Quantity{3}, .seq = taker, .id = OrderId{20}, .price = Price{0}},
+        };
+        EXPECT_EQ(this->listener.events, expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, MarketIntoEmptyBookIsCancelledInFull) {
+        SeqNo taker = this->send(market_sell(OrderId{10}, Quantity{7}));
+
+        std::vector<Event> expected {
+            OrderAck{.side = Side::Sell, .qty = Quantity{7}, .seq = taker, .id = OrderId{10}, .price = Price{0}},
+            CancelAck{.side = Side::Sell, .qty = Quantity{7}, .seq = taker, .id = OrderId{10}, .price = Price{0}},
+        };
+        EXPECT_EQ(this->listener.events, expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
     // ---- depth_at, run once per side ----
 
     template <typename BookT, Side s>

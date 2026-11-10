@@ -34,6 +34,22 @@ namespace lob {
 
     static_assert(sizeof(Trade) == 40);
     static_assert(std::is_trivially_copyable_v<Trade>);
+
+    // Quantity removed from the book or from an incoming order without trading.
+    // For an IOC or market order: emitted after its Trades, qty = the unfilled remainder,
+    // other fields copied from the order as submitted.
+    struct CancelAck {
+        Side side;
+        Quantity qty;
+        SeqNo seq;
+        OrderId id;
+        Price price;
+
+        constexpr bool operator==(const CancelAck&) const noexcept = default;
+    };
+
+    static_assert(sizeof(CancelAck) == 32);
+    static_assert(std::is_trivially_copyable_v<CancelAck>);
 }
 
 #endif //ORDERBOOK_EVENTS_H

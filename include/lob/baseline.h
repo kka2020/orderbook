@@ -50,8 +50,20 @@ namespace lob {
                 new_order.side == Side::Buy ? asks.cross(new_order, listener) : bids.cross(new_order, listener)
             };
 
-            // If there is not remaining quantity, we don't need to rest an order
+            // If there is not remaining quantity, we don't need to rest an order or cancel
             if (remaining_qty.value == 0) {
+                return;
+            }
+
+            // If the order is IOC or Market, we cancel the order for the remaining quantity
+            if (!rests(new_order.tif)) {
+                listener.on(CancelAck{
+                    .side = new_order.side,
+                    .qty = remaining_qty,
+                    .seq = new_order.seq,
+                    .id = new_order.id,
+                    .price = new_order.price,
+                });
                 return;
             }
 
@@ -104,9 +116,10 @@ namespace lob {
 
             [[nodiscard]] Quantity cross(const NewOrder& taker, Listener& l) {
                 Quantity remaining_qty {taker.qty};
-                // Check that price still crosses this book
-                while (crosses(taker.price) && remaining_qty.value > 0) {
-                    // levels must be non-empty if taker price crosses, so this is safe
+                // Check that book side is non-empty, the taker has quantity left, and that the taker's price still
+                // crosses the book if it's not a market order
+                while (!levels.empty() && (is_market(taker.tif) || crosses(taker.price)) && remaining_qty.value > 0) {
+                    // We already check that levels is non-empty, so this is safe
                     auto level {levels.begin()};
                     auto& [price, best_orders] = *level;
 
