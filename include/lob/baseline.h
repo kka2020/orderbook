@@ -197,6 +197,26 @@ namespace lob {
         }
 
         void handle(const NewOrder &new_order) {
+            // Check if new_order is valid + store reason for rejection (if any)
+            std::optional<RejectReason> reject_reason {};
+            if (new_order.qty == Quantity{0}) {
+                reject_reason.emplace(RejectReason::ZeroQuantity);
+            } else if (!is_market(new_order.tif) && is_invalid_price(new_order.price)) {
+                reject_reason.emplace(RejectReason::InvalidPrice);
+            } else if (cancel_table.contains(new_order.id)) {
+                reject_reason.emplace(RejectReason::DuplicateId);
+            }
+
+            // If the order isn't valid, emit OrderReject with the stored rejection reason and early return
+            if (reject_reason) {
+                listener.on(OrderReject{
+                    .reason = *reject_reason,
+                    .seq = new_order.seq,
+                    .id = new_order.id,
+                });
+                return;
+            }
+
             listener.on(OrderAck{
                 .side = new_order.side,
                 .qty = new_order.qty,
@@ -252,7 +272,10 @@ namespace lob {
 
         void handle(const Modify& modify) {
             auto cancel_table_it {cancel_table.find(modify.id)};
-            if (cancel_table_it == cancel_table.end() || cancel_table_it->second.side != modify.side) {
+            if (cancel_table_it == cancel_table.end()
+                || cancel_table_it->second.side != modify.side
+                || modify.new_quantity == Quantity{0}
+                || is_invalid_price(modify.new_price)) {
                 listener.on(ModifyReject{
                     .seq = modify.seq,
                     .id = modify.id,

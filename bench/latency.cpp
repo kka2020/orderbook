@@ -49,10 +49,11 @@ namespace {
     // Counts events and nothing else: no I/O or allocation inside the timed region. The counts
     // are printed at the end, which also stops the compiler from optimising the work away.
     struct CountingListener {
-        std::uint64_t acks = 0, trades = 0, cancel_acks = 0, cancel_rejects = 0;
+        std::uint64_t acks = 0, order_rejects = 0, trades = 0, cancel_acks = 0, cancel_rejects = 0;
         std::uint64_t modify_acks = 0, modify_rejects = 0;
 
         void on(const lob::OrderAck&) noexcept { ++acks; }
+        void on(const lob::OrderReject&) noexcept { ++order_rejects; }
         void on(const lob::Trade&) noexcept { ++trades; }
         void on(const lob::CancelAck&) noexcept { ++cancel_acks; }
         void on(const lob::CancelReject&) noexcept { ++cancel_rejects; }
@@ -216,8 +217,9 @@ namespace {
         auto pct = [&](std::size_t n) { return 100.0 * static_cast<double>(n) / static_cast<double>(messages); };
         std::printf("Workload: %zu timed messages: %.1f%% new, %.1f%% cancel, %.1f%% modify\n", messages,
                     pct(r.samples[New]), pct(r.samples[Cancel]), pct(r.samples[Modify]));
-        std::printf("Outcome:  %llu trades, %llu cancel acks (incl. IOC remainders), %llu cancel rejects, "
+        std::printf("Outcome:  %llu order rejects, %llu trades, %llu cancel acks (incl. IOC remainders), %llu cancel rejects, "
                     "%llu modify acks, %llu modify rejects\n",
+                    static_cast<unsigned long long>(c.order_rejects),
                     static_cast<unsigned long long>(c.trades), static_cast<unsigned long long>(c.cancel_acks),
                     static_cast<unsigned long long>(c.cancel_rejects), static_cast<unsigned long long>(c.modify_acks),
                     static_cast<unsigned long long>(c.modify_rejects));

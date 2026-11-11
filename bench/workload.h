@@ -80,6 +80,7 @@ namespace lob::bench {
             Generator* gen;
             void on(const Trade& t) noexcept;
             void on(const OrderAck&) noexcept {}
+            void on(const OrderReject&) noexcept {}  // the generator only emits valid orders
             void on(const CancelAck&) noexcept {}
             void on(const CancelReject&) noexcept {}
             void on(const ModifyAck&) noexcept {}

@@ -807,6 +807,163 @@ namespace lob::test {
         EXPECT_EQ(this->book.depth_at(Price{55}, Side::Sell), 3u);
     }
 
+    // ---- Rejecting invalid new orders and modifies ----
+    // A rejected new order gets exactly one event, OrderReject (no OrderAck, no Trade, no CancelAck),
+    // and changes nothing. Checks run in this order and the first failure is the reason reported:
+    // ZeroQuantity, then InvalidPrice (INT64_MIN/INT64_MAX; not checked for market orders), then
+    // DuplicateId (the id is resting right now).
+
+    constexpr Price min_price {std::numeric_limits<std::int64_t>::min()};
+    constexpr Price max_price {std::numeric_limits<std::int64_t>::max()};
+
+    TYPED_TEST(RulesTest, ZeroQuantityOrderIsRejectedInsteadOfAcked) {
+        SeqNo sent = this->send(buy(OrderId{10}, Price{50}, Quantity{0}));
+
+        std::vector<Event> expected {
+            OrderReject{.reason = RejectReason::ZeroQuantity, .seq = sent, .id = OrderId{10}},
+        };
+        EXPECT_EQ(this->listener.events, expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, ZeroQuantityIocAndMarketOrdersAreRejectedWithoutACancelAck) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        SeqNo ioc = this->send(ioc_buy(OrderId{20}, Price{50}, Quantity{0}));
+        SeqNo market = this->send(market_buy(OrderId{30}, Quantity{0}));
+
+        std::vector<OrderReject> expected {
+            OrderReject{.reason = RejectReason::ZeroQuantity, .seq = ioc, .id = OrderId{20}},
+            OrderReject{.reason = RejectReason::ZeroQuantity, .seq = market, .id = OrderId{30}},
+        };
+        EXPECT_EQ(this->order_rejects(), expected);
+        EXPECT_TRUE(this->cancel_acks().empty());
+        EXPECT_TRUE(this->trades().empty());
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Sell), 5u);
+    }
+
+    TYPED_TEST(RulesTest, PriceOfInt64MinOrMaxIsRejected) {
+        SeqNo low = this->send(buy(OrderId{10}, min_price, Quantity{5}));
+        SeqNo high = this->send(sell(OrderId{20}, max_price, Quantity{5}));
+        SeqNo ioc = this->send(ioc_sell(OrderId{30}, min_price, Quantity{5}));
+
+        std::vector<Event> expected {
+            OrderReject{.reason = RejectReason::InvalidPrice, .seq = low, .id = OrderId{10}},
+            OrderReject{.reason = RejectReason::InvalidPrice, .seq = high, .id = OrderId{20}},
+            OrderReject{.reason = RejectReason::InvalidPrice, .seq = ioc, .id = OrderId{30}},
+        };
+        EXPECT_EQ(this->listener.events, expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, PricesOneTickInsideTheExtremesAreAccepted) {
+        const Price lowest {min_price.value + 1};
+        const Price highest {max_price.value - 1};
+        this->send(buy(OrderId{10}, lowest, Quantity{5}));
+        this->send(sell(OrderId{20}, highest, Quantity{5}));
+
+        EXPECT_TRUE(this->order_rejects().empty());
+        EXPECT_EQ(this->book.best_bid(), lowest);
+        EXPECT_EQ(this->book.best_ask(), highest);
+    }
+
+    TYPED_TEST(RulesTest, MarketOrderPriceIsNotValidated) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        // A market order's price field is ignored, so even INT64_MAX there is not a reject.
+        this->send(new_order(Side::Buy, OrderId{20}, max_price, Quantity{5}, TimeInForce::Market));
+
+        EXPECT_TRUE(this->order_rejects().empty());
+        ASSERT_EQ(this->trades().size(), 1u);
+        EXPECT_EQ(this->trades()[0].price, Price{50});
+    }
+
+    TYPED_TEST(RulesTest, DuplicateOfARestingIdIsRejectedAndTheRestingOrderIsUntouched) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        SeqNo dup = this->send(sell(OrderId{10}, Price{60}, Quantity{3}));
+
+        std::vector<OrderReject> expected {
+            OrderReject{.reason = RejectReason::DuplicateId, .seq = dup, .id = OrderId{10}},
+        };
+        EXPECT_EQ(this->order_rejects(), expected);
+        EXPECT_EQ(this->order_acks().size(), 1u);  // only the original order's ack
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Buy), 5u);
+
+        // The id still belongs to the original order: cancelling it removes the buy at 50.
+        SeqNo cancelled = this->send(cancel(OrderId{10}));
+        std::vector<CancelAck> acks {
+            CancelAck{.side = Side::Buy, .qty = Quantity{5}, .seq = cancelled, .id = OrderId{10}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->cancel_acks(), acks);
+    }
+
+    TYPED_TEST(RulesTest, DuplicateIdIsRejectedBeforeItCanTrade) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        // Same id, crossing price: without the check this would trade the order against itself.
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        // An IOC never rests, but its id must still not clash with a live order.
+        this->send(ioc_buy(OrderId{10}, Price{50}, Quantity{5}));
+
+        EXPECT_EQ(this->order_rejects().size(), 2u);
+        EXPECT_TRUE(this->trades().empty());
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Sell), 5u);
+    }
+
+    TYPED_TEST(RulesTest, RejectedOrderNeverRestsSoItsIdCannotBeCancelled) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{0}));
+        SeqNo cancelled = this->send(cancel(OrderId{10}));
+
+        std::vector<CancelReject> expected {CancelReject{.seq = cancelled, .id = OrderId{10}}};
+        EXPECT_EQ(this->cancel_rejects(), expected);
+    }
+
+    TYPED_TEST(RulesTest, FirstFailingCheckIsTheReasonReported) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        // Zero qty AND invalid price AND duplicate id: zero quantity is checked first.
+        SeqNo all_three = this->send(sell(OrderId{10}, max_price, Quantity{0}));
+        // Invalid price AND duplicate id: price is checked before the id.
+        SeqNo two = this->send(sell(OrderId{10}, min_price, Quantity{5}));
+
+        std::vector<OrderReject> expected {
+            OrderReject{.reason = RejectReason::ZeroQuantity, .seq = all_three, .id = OrderId{10}},
+            OrderReject{.reason = RejectReason::InvalidPrice, .seq = two, .id = OrderId{10}},
+        };
+        EXPECT_EQ(this->order_rejects(), expected);
+    }
+
+    TYPED_TEST(RulesTest, ModifyToZeroQuantityIsRejectedAndKeepsTimePriority) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(buy(OrderId{20}, Price{50}, Quantity{5}));
+        SeqNo modified = this->send(modify(OrderId{10}, Side::Buy, Price{50}, Quantity{0}));
+
+        std::vector<ModifyReject> expected {ModifyReject{.seq = modified, .id = OrderId{10}}};
+        EXPECT_EQ(this->modify_rejects(), expected);
+        EXPECT_TRUE(this->modify_acks().empty());
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Buy), 10u);
+
+        // Order 10 is still first in the queue: a rejected modify must not cancel-and-reinsert.
+        this->send(sell(OrderId{30}, Price{50}, Quantity{5}));
+        ASSERT_EQ(this->trades().size(), 1u);
+        EXPECT_EQ(this->trades()[0].maker_id, OrderId{10});
+    }
+
+    TYPED_TEST(RulesTest, ModifyToInt64MinOrMaxPriceIsRejectedAndChangesNothing) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{60}, Quantity{5}));
+        // Repricing the buy to INT64_MAX would also cross the ask: it must be rejected, not traded.
+        SeqNo high = this->send(modify(OrderId{10}, Side::Buy, max_price, Quantity{5}));
+        SeqNo low = this->send(modify(OrderId{20}, Side::Sell, min_price, Quantity{5}));
+
+        std::vector<ModifyReject> expected {
+            ModifyReject{.seq = high, .id = OrderId{10}},
+            ModifyReject{.seq = low, .id = OrderId{20}},
+        };
+        EXPECT_EQ(this->modify_rejects(), expected);
+        EXPECT_TRUE(this->trades().empty());
+        EXPECT_EQ(this->book.best_bid(), Price{50});
+        EXPECT_EQ(this->book.best_ask(), Price{60});
+    }
+
     // ---- depth_at, run once per side ----
 
     template <typename BookT, Side s>

@@ -21,12 +21,14 @@ namespace lob {
     concept EventListener = requires(L& l,
         const Trade& trade,
         const OrderAck& order_ack,
+        const OrderReject& order_reject,
         const CancelAck& cancel_ack,
         const CancelReject& cancel_reject,
         const ModifyAck& modify_ack,
         const ModifyReject& modify_reject) {
         l.on(trade);
         l.on(order_ack);
+        l.on(order_reject);
         l.on(cancel_ack);
         l.on(cancel_reject);
         l.on(modify_ack);

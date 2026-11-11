@@ -2,6 +2,7 @@
 #define ORDERBOOK_TYPES_H
 #include <cstdint>
 #include <compare> // IWYU pragma: keep  (needed for defaulted <=>, even though no name from it is written)
+#include <limits>
 
 namespace lob {
     template <typename Tag, typename Rep>
@@ -13,6 +14,13 @@ namespace lob {
     };
 
     using Price = Strong<struct PriceTag, std::int64_t>;
+
+    constexpr bool is_invalid_price(Price price) {
+        constexpr Price min_price {std::numeric_limits<std::int64_t>::min()};
+        constexpr Price max_price {std::numeric_limits<std::int64_t>::max()};
+
+        return price == min_price || price == max_price;
+    }
 
     using Quantity = Strong<struct QuantityTag, std::uint32_t>;
 

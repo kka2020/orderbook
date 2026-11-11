@@ -29,6 +29,21 @@ namespace lob {
             << " price=" << e.price.value << " qty=" << e.qty.value << "}";
     }
 
+    inline void PrintTo(RejectReason r, std::ostream* os) {
+        switch (r) {
+            case RejectReason::ZeroQuantity: *os << "ZeroQuantity"; return;
+            case RejectReason::InvalidPrice: *os << "InvalidPrice"; return;
+            case RejectReason::DuplicateId: *os << "DuplicateId"; return;
+        }
+        *os << "RejectReason(" << static_cast<int>(r) << ")";
+    }
+
+    inline void PrintTo(const OrderReject& e, std::ostream* os) {
+        *os << "OrderReject{seq=" << e.seq.value << " id=" << e.id.value << " reason=";
+        PrintTo(e.reason, os);
+        *os << "}";
+    }
+
     inline void PrintTo(const Trade& e, std::ostream* os) {
         *os << "Trade{seq=" << e.seq.value << " maker=" << e.maker_id.value
             << " taker=" << e.taker_id.value << " price=" << e.price.value
@@ -110,12 +125,13 @@ namespace lob::test {
 
     // Everything the book can emit, in emission order. One overload of on() per event type,
     // so the listener interface the book must call is spelled out here.
-    using Event = std::variant<OrderAck, Trade, CancelAck, CancelReject, ModifyAck, ModifyReject>;
+    using Event = std::variant<OrderAck, OrderReject, Trade, CancelAck, CancelReject, ModifyAck, ModifyReject>;
 
     struct RecordingListener {
         std::vector<Event> events;
 
         void on(const OrderAck& e) { events.emplace_back(e); }
+        void on(const OrderReject& e) { events.emplace_back(e); }
         void on(const Trade& e) { events.emplace_back(e); }
         void on(const CancelAck& e) { events.emplace_back(e); }
         void on(const CancelReject& e) { events.emplace_back(e); }
@@ -152,6 +168,8 @@ namespace lob::test {
             return out;
         }
 
+        [[nodiscard]] std::vector<OrderAck> order_acks() const { return events_of<OrderAck>(); }
+        [[nodiscard]] std::vector<OrderReject> order_rejects() const { return events_of<OrderReject>(); }
         [[nodiscard]] std::vector<Trade> trades() const { return events_of<Trade>(); }
         [[nodiscard]] std::vector<CancelAck> cancel_acks() const { return events_of<CancelAck>(); }
         [[nodiscard]] std::vector<CancelReject> cancel_rejects() const { return events_of<CancelReject>(); }

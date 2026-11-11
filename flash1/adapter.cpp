@@ -23,7 +23,7 @@ namespace {
 
     // Receives lob events and pushes the matching flash1 report into the harness transport.
     // Report fields the canonical hash reads (src/correctness.cpp):
-    //   OrderAck     seq, side, order_id, price, qty
+    //   OrderAck     seq, side, order_id, price, qty   (OrderReject has no flash1 equivalent)
     //   Trade        seq, price, qty, maker_id, taker_id
     //   CancelAck    seq, side, order_id, price        (qty is NOT hashed)
     //   ModifyAck    seq, side, order_id, price, qty
@@ -34,6 +34,16 @@ namespace {
 
         void on(const lob::OrderAck& e) const noexcept {
             push(ack(ME_ORDER_ACK, e.side, e.seq, e.id, e.price, e.qty));
+        }
+
+        // flash1's ABI has no new-order reject: its workload is contract-legal (qty > 0, no live
+        // duplicate ids, prices far from the int64 extremes), so a reject means the adapter or
+        // book is wrong. Fail loudly rather than emit a report the harness cannot represent.
+        [[noreturn]] void on(const lob::OrderReject& e) const noexcept {
+            std::fprintf(stderr, "flash1 adapter: book rejected order id %llu (seq %llu, reason %u)\n",
+                         static_cast<unsigned long long>(e.id.value),
+                         static_cast<unsigned long long>(e.seq.value), static_cast<unsigned>(e.reason));
+            std::abort();
         }
 
         void on(const lob::Trade& e) const noexcept {

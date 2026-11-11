@@ -1,5 +1,6 @@
 #ifndef ORDERBOOK_EVENTS_H
 #define ORDERBOOK_EVENTS_H
+#include <cstdint>
 #include <type_traits>
 
 #include "types.h"
@@ -19,6 +20,26 @@ namespace lob {
 
     static_assert(sizeof(OrderAck) == 32);
     static_assert(std::is_trivially_copyable_v<OrderAck>);
+
+    // Why a new order was rejected. When several apply, the first in this order is reported.
+    enum class RejectReason : std::uint8_t {
+        ZeroQuantity,  // qty == 0 (any time in force)
+        InvalidPrice,  // GTC or IOC with price INT64_MIN or INT64_MAX (a market order's price is ignored)
+        DuplicateId,   // the id belongs to an order resting right now (reuse after a fill or cancel is fine)
+    };
+
+    // Emitted INSTEAD of OrderAck for a new order that is not accepted. Nothing else is emitted for
+    // it and the book is unchanged. seq and id are the rejected order's.
+    struct OrderReject {
+        RejectReason reason;
+        SeqNo seq;
+        OrderId id;
+
+        constexpr bool operator==(const OrderReject&) const noexcept = default;
+    };
+
+    static_assert(sizeof(OrderReject) == 24);
+    static_assert(std::is_trivially_copyable_v<OrderReject>);
 
     // One fill between a resting order (maker) and the incoming order (taker).
     // price is the maker's price; seq is the taker's (aggressor's) sequence number.
@@ -81,8 +102,10 @@ namespace lob {
     static_assert(sizeof(ModifyAck) == 32);
     static_assert(std::is_trivially_copyable_v<ModifyAck>);
 
-    // A Modify that could not be applied: the id is not resting right now, or the Modify's
-    // side differs from the resting order's side. The book is unchanged.
+    // A Modify that could not be applied: the id is not resting right now, the Modify's side
+    // differs from the resting order's side, the new quantity is 0, or the new price is
+    // INT64_MIN or INT64_MAX. The book is unchanged: a rejected modify leaves the order resting
+    // exactly as it was, with its time priority.
     struct ModifyReject {
         SeqNo seq;
         OrderId id;

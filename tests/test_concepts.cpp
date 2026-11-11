@@ -77,6 +77,7 @@ namespace lob::test {
 
         struct GoodListener {
             void on(const OrderAck&) {}
+            void on(const OrderReject&) {}
             void on(const Trade&) {}
             void on(const CancelAck&) {}
             void on(const CancelReject&) {}
@@ -93,10 +94,21 @@ namespace lob::test {
         // Missing one event type
         struct BadNoModifyReject {
             void on(const OrderAck&) {}
+            void on(const OrderReject&) {}
             void on(const Trade&) {}
             void on(const CancelAck&) {}
             void on(const CancelReject&) {}
             void on(const ModifyAck&) {}
+        };
+
+        // Missing the new-order reject: a book could reject an order and have nowhere to report it
+        struct BadNoOrderReject {
+            void on(const OrderAck&) {}
+            void on(const Trade&) {}
+            void on(const CancelAck&) {}
+            void on(const CancelReject&) {}
+            void on(const ModifyAck&) {}
+            void on(const ModifyReject&) {}
         };
 
         static_assert(EventListener<GoodListener>);
@@ -104,6 +116,7 @@ namespace lob::test {
         static_assert(EventListener<RecordingListener>);
 
         static_assert(!EventListener<BadNoModifyReject>);
+        static_assert(!EventListener<BadNoOrderReject>);
         static_assert(!EventListener<int>);
     }
 }
