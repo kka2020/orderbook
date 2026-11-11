@@ -64,6 +64,34 @@ namespace lob {
 
     static_assert(sizeof(CancelReject) == 16);
     static_assert(std::is_trivially_copyable_v<CancelReject>);
+
+    // A Modify of a resting order succeeded. Emitted after any Trades the reinsert caused.
+    // seq = the Modify's seq; qty and price = the new values requested (qty is the new open
+    // quantity, not added to what was left); side = the order's side.
+    struct ModifyAck {
+        Side side;
+        Quantity qty;
+        SeqNo seq;
+        OrderId id;
+        Price price;
+
+        constexpr bool operator==(const ModifyAck&) const noexcept = default;
+    };
+
+    static_assert(sizeof(ModifyAck) == 32);
+    static_assert(std::is_trivially_copyable_v<ModifyAck>);
+
+    // A Modify that could not be applied: the id is not resting right now, or the Modify's
+    // side differs from the resting order's side. The book is unchanged.
+    struct ModifyReject {
+        SeqNo seq;
+        OrderId id;
+
+        constexpr bool operator==(const ModifyReject&) const noexcept = default;
+    };
+
+    static_assert(sizeof(ModifyReject) == 16);
+    static_assert(std::is_trivially_copyable_v<ModifyReject>);
 }
 
 #endif //ORDERBOOK_EVENTS_H

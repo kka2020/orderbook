@@ -157,20 +157,12 @@ namespace lob {
             std::map<Price, OrderQueue, Compare> levels;
         };
 
-        void handle(const NewOrder &new_order) {
-            listener.on(OrderAck{
-                .side = new_order.side,
-                .qty = new_order.qty,
-                .seq = new_order.seq,
-                .id = new_order.id,
-                .price = new_order.price
-            });
-
+        void cross_and_rest(const NewOrder &new_order) {
             // Cross the opposite side
             Quantity remaining_qty {
                 new_order.side == Side::Buy ?
-                asks.cross(new_order, listener, cancel_table) :
-                bids.cross(new_order, listener, cancel_table)
+                    asks.cross(new_order, listener, cancel_table) :
+                    bids.cross(new_order, listener, cancel_table)
             };
 
             // If there is not remaining quantity, we don't need to rest an order or cancel
@@ -203,6 +195,34 @@ namespace lob {
             });
         }
 
+        void handle(const NewOrder &new_order) {
+            listener.on(OrderAck{
+                .side = new_order.side,
+                .qty = new_order.qty,
+                .seq = new_order.seq,
+                .id = new_order.id,
+                .price = new_order.price
+            });
+
+            cross_and_rest(new_order);
+        }
+
+        Quantity remove_resting(CancelTable::iterator cancel_table_it) {
+            auto [side, price, it] = cancel_table_it->second;
+            // Read qty now: 'it' is invalid once the order is erased. Returned so the caller can report it
+            Quantity qty {it->qty};
+
+            // Erase order from the book
+            if (side == Side::Buy) {
+                bids.cancel_order(price, it);
+            } else {
+                asks.cancel_order(price, it);
+            }
+
+            cancel_table.erase(cancel_table_it);
+            return qty;
+        }
+
         void handle(const Cancel &cancel) {
             // If the id lookup table doesn't contain the id we're trying to cancel, emit a rejection event and return
             auto cancel_table_it = cancel_table.find(cancel.id);
@@ -214,21 +234,10 @@ namespace lob {
                 return;
             }
 
-            // The id is in the lookup table, so fetch the side and price to access the correct list, and use the list
-            // iterator to erase the Order node from that list
-            auto [side, price, it] = cancel_table_it->second;
+            // The id is resting. Copy side and price for the CancelAck now, because remove_resting erases the entry
+            auto [side, price, _] = cancel_table_it->second;
 
-            // Store qty for later CancelAck emit that happens after 'it' has been erased
-            Quantity qty {it->qty};
-
-            // Erase order from the book
-            if (side == Side::Buy) {
-                bids.cancel_order(price, it);
-            } else {
-                asks.cancel_order(price, it);
-            }
-
-            cancel_table.erase(cancel_table_it);
+            Quantity qty = remove_resting(cancel_table_it);
 
             // Emit CancelAck event
             listener.on(CancelAck{
@@ -240,7 +249,37 @@ namespace lob {
             });
         }
 
-        void handle(const Modify& /*modify*/) {}
+        void handle(const Modify& modify) {
+            auto cancel_table_it {cancel_table.find(modify.id)};
+            if (cancel_table_it == cancel_table.end() || cancel_table_it->second.side != modify.side) {
+                listener.on(ModifyReject{
+                    .seq = modify.seq,
+                    .id = modify.id,
+                });
+                return;
+            }
+
+            Side side = cancel_table_it->second.side;
+            remove_resting(cancel_table_it);
+
+            NewOrder new_order {
+                .side = side,
+                .tif = TimeInForce::GTC,
+                .qty = modify.new_quantity,
+                .seq = modify.seq,
+                .id = modify.id,
+                .price = modify.new_price,
+            };
+            cross_and_rest(new_order);
+
+            listener.on(ModifyAck{
+                .side = side,
+                .qty = modify.new_quantity,
+                .seq = modify.seq,
+                .id = modify.id,
+                .price = modify.new_price,
+            });
+        }
 
         Listener& listener;
         BookSide<Side::Buy> bids;

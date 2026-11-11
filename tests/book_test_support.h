@@ -44,6 +44,16 @@ namespace lob {
     inline void PrintTo(const CancelReject& e, std::ostream* os) {
         *os << "CancelReject{seq=" << e.seq.value << " id=" << e.id.value << "}";
     }
+
+    inline void PrintTo(const ModifyAck& e, std::ostream* os) {
+        *os << "ModifyAck{seq=" << e.seq.value << " id=" << e.id.value
+            << " side=" << (e.side == Side::Buy ? "Buy" : "Sell")
+            << " price=" << e.price.value << " qty=" << e.qty.value << "}";
+    }
+
+    inline void PrintTo(const ModifyReject& e, std::ostream* os) {
+        *os << "ModifyReject{seq=" << e.seq.value << " id=" << e.id.value << "}";
+    }
 }
 
 namespace lob::test {
@@ -89,13 +99,18 @@ namespace lob::test {
         return Cancel {.seq = SeqNo{1}, .id = id};
     }
 
+    // new_qty is the order's new open quantity (not added to what is left).
+    inline Modify modify(OrderId id, Side side, Price new_price, Quantity new_qty) {
+        return Modify {.side = side, .new_quantity = new_qty, .seq = SeqNo{1}, .id = id, .new_price = new_price};
+    }
+
     inline Side opposite(Side side) {
         return side == Side::Buy ? Side::Sell : Side::Buy;
     }
 
     // Everything the book can emit, in emission order. One overload of on() per event type,
     // so the listener interface the book must call is spelled out here.
-    using Event = std::variant<OrderAck, Trade, CancelAck, CancelReject>;
+    using Event = std::variant<OrderAck, Trade, CancelAck, CancelReject, ModifyAck, ModifyReject>;
 
     struct RecordingListener {
         std::vector<Event> events;
@@ -104,6 +119,8 @@ namespace lob::test {
         void on(const Trade& e) { events.emplace_back(e); }
         void on(const CancelAck& e) { events.emplace_back(e); }
         void on(const CancelReject& e) { events.emplace_back(e); }
+        void on(const ModifyAck& e) { events.emplace_back(e); }
+        void on(const ModifyReject& e) { events.emplace_back(e); }
     };
 
     // Shared fixture: a book wired to a RecordingListener.
@@ -138,6 +155,8 @@ namespace lob::test {
         [[nodiscard]] std::vector<Trade> trades() const { return events_of<Trade>(); }
         [[nodiscard]] std::vector<CancelAck> cancel_acks() const { return events_of<CancelAck>(); }
         [[nodiscard]] std::vector<CancelReject> cancel_rejects() const { return events_of<CancelReject>(); }
+        [[nodiscard]] std::vector<ModifyAck> modify_acks() const { return events_of<ModifyAck>(); }
+        [[nodiscard]] std::vector<ModifyReject> modify_rejects() const { return events_of<ModifyReject>(); }
 
     private:
         std::uint64_t next_seq_ {1};

@@ -614,6 +614,199 @@ namespace lob::test {
         EXPECT_EQ(this->book.best_ask(), std::nullopt);
     }
 
+    // ---- Modify: cancel + reinsert at the new price/quantity (loses time priority) ----
+
+    TYPED_TEST(RulesTest, ModifyRepricesARestingOrderAndAcks) {
+        SeqNo placed = this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        SeqNo modified = this->send(modify(OrderId{10}, Side::Buy, Price{52}, Quantity{5}));
+
+        // No OrderAck or CancelAck for the cancel + reinsert: just the ModifyAck
+        std::vector<Event> expected {
+            OrderAck{.side = Side::Buy, .qty = Quantity{5}, .seq = placed, .id = OrderId{10}, .price = Price{50}},
+            ModifyAck{.side = Side::Buy, .qty = Quantity{5}, .seq = modified, .id = OrderId{10}, .price = Price{52}},
+        };
+        EXPECT_EQ(this->listener.events, expected);
+        EXPECT_EQ(this->book.best_bid(), Price{52});
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Buy), 0u);
+        EXPECT_EQ(this->book.depth_at(Price{52}, Side::Buy), 5u);
+    }
+
+    TYPED_TEST(RulesTest, ModifyChangesQuantityAtTheSamePrice) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        SeqNo modified = this->send(modify(OrderId{10}, Side::Sell, Price{50}, Quantity{8}));
+
+        std::vector<ModifyAck> expected {
+            ModifyAck{.side = Side::Sell, .qty = Quantity{8}, .seq = modified, .id = OrderId{10}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->modify_acks(), expected);
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Sell), 8u);
+    }
+
+    TYPED_TEST(RulesTest, ModifyLosesTimePriorityEvenAtTheSamePrice) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{50}, Quantity{5}));
+        this->send(modify(OrderId{10}, Side::Sell, Price{50}, Quantity{6}));
+
+        SeqNo taker = this->send(buy(OrderId{30}, Price{50}, Quantity{5}));
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{20}, .taker_id = OrderId{30}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Sell), 6u);
+    }
+
+    TYPED_TEST(RulesTest, ModifiedOrderCanBeCancelledAtItsNewPlace) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(modify(OrderId{10}, Side::Buy, Price{48}, Quantity{7}));
+        SeqNo cancelled = this->send(cancel(OrderId{10}));
+
+        std::vector<CancelAck> expected {
+            CancelAck{.side = Side::Buy, .qty = Quantity{7}, .seq = cancelled, .id = OrderId{10}, .price = Price{48}},
+        };
+        EXPECT_EQ(this->cancel_acks(), expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, ModifyOfPartlyFilledOrderRestsTheNewQuantity) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{10}));
+        this->send(buy(OrderId{20}, Price{50}, Quantity{4}));  // 6 left resting
+        SeqNo modified = this->send(modify(OrderId{10}, Side::Sell, Price{51}, Quantity{7}));
+
+        std::vector<ModifyAck> expected {
+            ModifyAck{.side = Side::Sell, .qty = Quantity{7}, .seq = modified, .id = OrderId{10}, .price = Price{51}},
+        };
+        EXPECT_EQ(this->modify_acks(), expected);
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Sell), 0u);
+        EXPECT_EQ(this->book.depth_at(Price{51}, Side::Sell), 7u);
+    }
+
+    TYPED_TEST(RulesTest, RepricingOneOfTwoSamePriceOrdersKeepsTheSibling) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(buy(OrderId{20}, Price{50}, Quantity{5}));
+        this->send(modify(OrderId{10}, Side::Buy, Price{49}, Quantity{5}));
+
+        EXPECT_EQ(this->book.best_bid(), Price{50});
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Buy), 5u);
+        EXPECT_EQ(this->book.depth_at(Price{49}, Side::Buy), 5u);
+
+        SeqNo taker = this->send(sell(OrderId{30}, Price{50}, Quantity{5}));
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{20}, .taker_id = OrderId{30}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+    }
+
+    // ---- Modify that crosses: trades at the maker's price first, then the ModifyAck ----
+
+    TYPED_TEST(RulesTest, BuyModifyThatCrossesTradesAtMakerPriceThenAcks) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(buy(OrderId{20}, Price{45}, Quantity{5}));
+        auto before = this->listener.events.size();
+        SeqNo modified = this->send(modify(OrderId{20}, Side::Buy, Price{52}, Quantity{5}));
+
+        std::vector<Event> expected {
+            Trade{.qty = Quantity{5}, .seq = modified, .maker_id = OrderId{10}, .taker_id = OrderId{20}, .price = Price{50}},
+            ModifyAck{.side = Side::Buy, .qty = Quantity{5}, .seq = modified, .id = OrderId{20}, .price = Price{52}},
+        };
+        std::vector<Event> emitted(this->listener.events.begin() + static_cast<std::ptrdiff_t>(before),
+                                   this->listener.events.end());
+        EXPECT_EQ(emitted, expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, SellModifyThatCrossesTradesAtMakerPrice) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{55}, Quantity{5}));
+        SeqNo modified = this->send(modify(OrderId{20}, Side::Sell, Price{48}, Quantity{5}));
+
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{5}, .seq = modified, .maker_id = OrderId{10}, .taker_id = OrderId{20}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->modify_acks().size(), 1u);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, CrossingModifyRestsItsRemainderAtTheNewPrice) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{3}));
+        this->send(buy(OrderId{20}, Price{45}, Quantity{8}));
+        this->send(modify(OrderId{20}, Side::Buy, Price{51}, Quantity{8}));
+
+        ASSERT_EQ(this->trades().size(), 1u);
+        EXPECT_EQ(this->trades()[0].qty, Quantity{3});
+        EXPECT_EQ(this->book.best_bid(), Price{51});
+        EXPECT_EQ(this->book.depth_at(Price{51}, Side::Buy), 5u);
+        EXPECT_EQ(this->book.depth_at(Price{45}, Side::Buy), 0u);
+
+        // The rested remainder is still reachable by id
+        SeqNo cancelled = this->send(cancel(OrderId{20}));
+        std::vector<CancelAck> expected {
+            CancelAck{.side = Side::Buy, .qty = Quantity{5}, .seq = cancelled, .id = OrderId{20}, .price = Price{51}},
+        };
+        EXPECT_EQ(this->cancel_acks(), expected);
+    }
+
+    TYPED_TEST(RulesTest, FullyFilledModifyLeavesNothingToCancel) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(buy(OrderId{20}, Price{45}, Quantity{5}));
+        this->send(modify(OrderId{20}, Side::Buy, Price{50}, Quantity{5}));
+        SeqNo cancelled = this->send(cancel(OrderId{20}));
+
+        std::vector<CancelReject> expected {CancelReject{.seq = cancelled, .id = OrderId{20}}};
+        EXPECT_EQ(this->cancel_rejects(), expected);
+    }
+
+    // ---- Modify rejects: the book must not change ----
+
+    TYPED_TEST(RulesTest, ModifyOfUnknownIdIsRejectedAndChangesNothing) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        SeqNo modified = this->send(modify(OrderId{99}, Side::Buy, Price{52}, Quantity{5}));
+
+        std::vector<ModifyReject> expected {ModifyReject{.seq = modified, .id = OrderId{99}}};
+        EXPECT_EQ(this->modify_rejects(), expected);
+        EXPECT_TRUE(this->modify_acks().empty());
+        EXPECT_EQ(this->book.best_bid(), Price{50});
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Buy), 5u);
+    }
+
+    TYPED_TEST(RulesTest, ModifyOfFullyFilledOrderIsRejected) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(buy(OrderId{20}, Price{50}, Quantity{5}));
+        SeqNo modified = this->send(modify(OrderId{10}, Side::Sell, Price{51}, Quantity{5}));
+
+        std::vector<ModifyReject> expected {ModifyReject{.seq = modified, .id = OrderId{10}}};
+        EXPECT_EQ(this->modify_rejects(), expected);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, ModifyOfCancelledOrderIsRejected) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(cancel(OrderId{10}));
+        SeqNo modified = this->send(modify(OrderId{10}, Side::Buy, Price{50}, Quantity{6}));
+
+        std::vector<ModifyReject> expected {ModifyReject{.seq = modified, .id = OrderId{10}}};
+        EXPECT_EQ(this->modify_rejects(), expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, ModifyWithTheWrongSideIsRejectedAndLeavesTheOrderAlone) {
+        this->send(sell(OrderId{10}, Price{55}, Quantity{3}));
+        this->send(buy(OrderId{20}, Price{50}, Quantity{5}));
+        // Order 20 is a buy. Ignoring the Modify's side would reprice it to a buy at 55 (which
+        // crosses order 10); trusting the side would flip it to a sell. Both are wrong: reject.
+        SeqNo modified = this->send(modify(OrderId{20}, Side::Sell, Price{55}, Quantity{5}));
+
+        std::vector<ModifyReject> expected {ModifyReject{.seq = modified, .id = OrderId{20}}};
+        EXPECT_EQ(this->modify_rejects(), expected);
+        EXPECT_TRUE(this->modify_acks().empty());
+        EXPECT_TRUE(this->trades().empty());
+        EXPECT_EQ(this->book.best_bid(), Price{50});
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Buy), 5u);
+        EXPECT_EQ(this->book.depth_at(Price{55}, Side::Sell), 3u);
+    }
+
     // ---- depth_at, run once per side ----
 
     template <typename BookT, Side s>
