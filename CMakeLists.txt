@@ -48,12 +48,7 @@ if(LOB_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
-if(LOB_BUILD_BENCH AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/CMakeLists.txt)
-  FetchContent_Declare(benchmark
-    URL https://github.com/google/benchmark/archive/refs/tags/v1.9.1.tar.gz)
-  set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
-  set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(benchmark)
-
+# The latency benchmark times each operation itself (rdtsc), so it needs no benchmark library.
+if(LOB_BUILD_BENCH)
   add_subdirectory(bench)
 endif()
