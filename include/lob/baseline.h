@@ -11,24 +11,25 @@
 
 #include "types.h"
 #include "commands.h"
+#include "concepts.h"
 #include "events.h"
 
 namespace lob {
 
-    template <typename Listener>
+    template <EventListener Listener>
     class BaselineBook {
     public:
         explicit BaselineBook(Listener& l) : listener {l} {}
 
-        [[nodiscard]] std::optional<Price> best_bid() const {
+        [[nodiscard]] std::optional<Price> best_bid() const noexcept {
             return bids.get_best();
         }
 
-        [[nodiscard]] std::optional<Price> best_ask() const {
+        [[nodiscard]] std::optional<Price> best_ask() const noexcept {
             return asks.get_best();
         }
 
-        [[nodiscard]] std::uint64_t depth_at(Price price, Side side) const {
+        [[nodiscard]] std::uint64_t depth_at(Price price, Side side) const noexcept {
             if (side == Side::Buy) {
                 return bids.depth_at(price);
             }

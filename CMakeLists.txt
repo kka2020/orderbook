@@ -14,7 +14,9 @@ option(LOB_BUILD_BENCH "Build benchmarks" OFF)
 add_library(lob INTERFACE
         include/lob/types.h
         include/lob/commands.h
-        include/lob/baseline.h)
+        include/lob/baseline.h
+        include/lob/concepts.h
+        include/lob/events.h)
 add_library(lob::lob ALIAS lob)
 target_include_directories(lob INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(lob INTERFACE cxx_std_20)
