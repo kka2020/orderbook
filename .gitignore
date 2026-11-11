@@ -4,3 +4,4 @@ compile_commands.json
 *.so
 cachegrind.out.*
 .idea/
+flash1/.harness/
