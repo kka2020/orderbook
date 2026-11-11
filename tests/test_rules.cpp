@@ -445,6 +445,175 @@ namespace lob::test {
         EXPECT_EQ(this->book.best_ask(), std::nullopt);
     }
 
+    // ---- Cancel: remove a resting order by id ----
+
+    TYPED_TEST(RulesTest, CancelOfRestingOrderEmitsCancelAckAndEmptiesTheBook) {
+        SeqNo placed = this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        SeqNo cancelled = this->send(cancel(OrderId{10}));
+
+        std::vector<Event> expected {
+            OrderAck{.side = Side::Buy, .qty = Quantity{5}, .seq = placed, .id = OrderId{10}, .price = Price{50}},
+            CancelAck{.side = Side::Buy, .qty = Quantity{5}, .seq = cancelled, .id = OrderId{10}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->listener.events, expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Buy), 0u);
+    }
+
+    TYPED_TEST(RulesTest, CancelOfPartlyFilledMakerReportsWhatWasStillResting) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{10}));
+        this->send(buy(OrderId{20}, Price{50}, Quantity{4}));
+        SeqNo cancelled = this->send(cancel(OrderId{10}));
+
+        std::vector<CancelAck> expected {
+            CancelAck{.side = Side::Sell, .qty = Quantity{6}, .seq = cancelled, .id = OrderId{10}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->cancel_acks(), expected);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, CancelOfTakersRestingRemainderReportsTheRemainder) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{4}));
+        this->send(buy(OrderId{20}, Price{51}, Quantity{10}));
+        SeqNo cancelled = this->send(cancel(OrderId{20}));
+
+        std::vector<CancelAck> expected {
+            CancelAck{.side = Side::Buy, .qty = Quantity{6}, .seq = cancelled, .id = OrderId{20}, .price = Price{51}},
+        };
+        EXPECT_EQ(this->cancel_acks(), expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, CancellingTheOnlyOrderAtBestLeavesNoPhantomLevel) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{52}, Quantity{5}));
+        this->send(cancel(OrderId{10}));
+
+        EXPECT_EQ(this->book.best_ask(), Price{52});
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Sell), 0u);
+
+        // A buy at 50 must not trade against the cancelled order
+        this->send(buy(OrderId{30}, Price{50}, Quantity{5}));
+        EXPECT_TRUE(this->trades().empty());
+        EXPECT_EQ(this->book.best_bid(), Price{50});
+    }
+
+    TYPED_TEST(RulesTest, CancelInTheMiddleOfALevelKeepsTheOthersInArrivalOrder) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{50}, Quantity{5}));
+        this->send(sell(OrderId{30}, Price{50}, Quantity{5}));
+        this->send(cancel(OrderId{20}));
+
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Sell), 10u);
+
+        SeqNo taker = this->send(buy(OrderId{40}, Price{50}, Quantity{10}));
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{10}, .taker_id = OrderId{40}, .price = Price{50}},
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{30}, .taker_id = OrderId{40}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, CancelOfFrontOrderLetsTheNextOneFillFirst) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(buy(OrderId{20}, Price{50}, Quantity{5}));
+        this->send(cancel(OrderId{10}));
+
+        SeqNo taker = this->send(sell(OrderId{30}, Price{50}, Quantity{5}));
+        std::vector<Trade> expected {
+            Trade{.qty = Quantity{5}, .seq = taker, .maker_id = OrderId{20}, .taker_id = OrderId{30}, .price = Price{50}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+    }
+
+    // ---- Cancel rejects: the id is not resting right now; the book must not change ----
+
+    TYPED_TEST(RulesTest, CancelOfUnknownIdIsRejectedAndChangesNothing) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        SeqNo cancelled = this->send(cancel(OrderId{99}));
+
+        std::vector<CancelReject> expected {CancelReject{.seq = cancelled, .id = OrderId{99}}};
+        EXPECT_EQ(this->cancel_rejects(), expected);
+        EXPECT_TRUE(this->cancel_acks().empty());
+        EXPECT_EQ(this->book.best_bid(), Price{50});
+        EXPECT_EQ(this->book.depth_at(Price{50}, Side::Buy), 5u);
+    }
+
+    TYPED_TEST(RulesTest, CancelOfFullyFilledMakerIsRejected) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(buy(OrderId{20}, Price{50}, Quantity{5}));
+        SeqNo cancelled = this->send(cancel(OrderId{10}));
+
+        std::vector<CancelReject> expected {CancelReject{.seq = cancelled, .id = OrderId{10}}};
+        EXPECT_EQ(this->cancel_rejects(), expected);
+        EXPECT_TRUE(this->cancel_acks().empty());
+    }
+
+    TYPED_TEST(RulesTest, CancelOfFullyFilledTakerIsRejected) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(buy(OrderId{20}, Price{50}, Quantity{5}));
+        SeqNo cancelled = this->send(cancel(OrderId{20}));
+
+        std::vector<CancelReject> expected {CancelReject{.seq = cancelled, .id = OrderId{20}}};
+        EXPECT_EQ(this->cancel_rejects(), expected);
+        EXPECT_TRUE(this->cancel_acks().empty());
+    }
+
+    TYPED_TEST(RulesTest, SecondCancelOfTheSameOrderIsRejected) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(cancel(OrderId{10}));
+        SeqNo second = this->send(cancel(OrderId{10}));
+
+        std::vector<CancelReject> expected {CancelReject{.seq = second, .id = OrderId{10}}};
+        EXPECT_EQ(this->cancel_rejects(), expected);
+        EXPECT_EQ(this->cancel_acks().size(), 1u);
+    }
+
+    TYPED_TEST(RulesTest, CancelOfIocRemainderIsRejectedBecauseItNeverRested) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{4}));
+        this->send(ioc_buy(OrderId{20}, Price{50}, Quantity{10}));
+        SeqNo cancelled = this->send(cancel(OrderId{20}));
+
+        std::vector<CancelReject> expected {CancelReject{.seq = cancelled, .id = OrderId{20}}};
+        EXPECT_EQ(this->cancel_rejects(), expected);
+        EXPECT_EQ(this->cancel_acks().size(), 1u);  // only the IOC remainder's own CancelAck
+    }
+
+    // ---- Id reuse: once an order is gone, its id is free again ----
+
+    TYPED_TEST(RulesTest, IdCanBeReusedAfterCancel) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(cancel(OrderId{10}));
+        this->send(buy(OrderId{10}, Price{48}, Quantity{7}));
+
+        EXPECT_EQ(this->book.best_bid(), Price{48});
+
+        SeqNo cancelled = this->send(cancel(OrderId{10}));
+        CancelAck expected {.side = Side::Buy, .qty = Quantity{7}, .seq = cancelled, .id = OrderId{10}, .price = Price{48}};
+        ASSERT_EQ(this->cancel_acks().size(), 2u);
+        EXPECT_EQ(this->cancel_acks()[1], expected);
+        EXPECT_TRUE(this->cancel_rejects().empty());
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+    }
+
+    TYPED_TEST(RulesTest, IdCanBeReusedAfterFullFill) {
+        this->send(sell(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(buy(OrderId{20}, Price{50}, Quantity{5}));
+        this->send(sell(OrderId{10}, Price{55}, Quantity{3}));
+
+        EXPECT_EQ(this->book.best_ask(), Price{55});
+
+        SeqNo cancelled = this->send(cancel(OrderId{10}));
+        std::vector<CancelAck> expected {
+            CancelAck{.side = Side::Sell, .qty = Quantity{3}, .seq = cancelled, .id = OrderId{10}, .price = Price{55}},
+        };
+        EXPECT_EQ(this->cancel_acks(), expected);
+        EXPECT_TRUE(this->cancel_rejects().empty());
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
     // ---- depth_at, run once per side ----
 
     template <typename BookT, Side s>

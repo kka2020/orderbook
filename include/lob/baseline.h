@@ -6,6 +6,8 @@
 #include <functional>
 #include <algorithm>
 #include <type_traits>
+#include <unordered_map>
+#include <variant>
 
 #include "types.h"
 #include "commands.h"
@@ -35,51 +37,30 @@ namespace lob {
         }
 
         void apply(const Command &command) {
-            NewOrder new_order {std::get<NewOrder>(command)};
-
-            listener.on(OrderAck{
-                .side = new_order.side,
-                .qty = new_order.qty,
-                .seq = new_order.seq,
-                .id = new_order.id,
-                .price = new_order.price
-            });
-
-            // Cross the opposite side
-            Quantity remaining_qty {
-                new_order.side == Side::Buy ? asks.cross(new_order, listener) : bids.cross(new_order, listener)
-            };
-
-            // If there is not remaining quantity, we don't need to rest an order or cancel
-            if (remaining_qty.value == 0) {
-                return;
-            }
-
-            // If the order is IOC or Market, we cancel the order for the remaining quantity
-            if (!rests(new_order.tif)) {
-                listener.on(CancelAck{
-                    .side = new_order.side,
-                    .qty = remaining_qty,
-                    .seq = new_order.seq,
-                    .id = new_order.id,
-                    .price = new_order.price,
-                });
-                return;
-            }
-
-            // Otherwise, we proceed to rest the order
-            Order order = {.id = new_order.id, .qty = remaining_qty};
-            if (new_order.side == Side::Buy) {
-                bids.add(new_order.price, order);
-            } else {
-                asks.add(new_order.price, order);
-            }
+            std::visit([this](const auto &c) { handle(c); }, command);
         }
     private:
         struct Order {
             OrderId id;
             Quantity qty;
         };
+
+        using OrderQueue = std::list<Order>;
+        using OrderIt = OrderQueue::iterator;
+
+        struct OrderIdHash {
+            std::size_t operator()(OrderId id) const noexcept {
+                return std::hash<std::uint64_t>{}(id.value);
+            }
+        };
+
+        struct CancelTableEntry {
+            Side side;
+            Price price;
+            OrderIt it;
+        };
+
+        using CancelTable = std::unordered_map<OrderId, CancelTableEntry, OrderIdHash>;
 
         template <Side S>
         class BookSide {
@@ -93,10 +74,11 @@ namespace lob {
                 return first_entry->first;
             }
 
-            void add(Price price, Order order) {
+            OrderIt add(Price price, Order order) {
                 auto [level_it, _] = levels.try_emplace(price);
                 auto& queue {level_it->second};
-                queue.push_back(order);
+                auto order_it = queue.insert(queue.end(), order);
+                return order_it;
             }
 
             [[nodiscard]] std::uint64_t depth_at(Price price) const {
@@ -114,7 +96,7 @@ namespace lob {
                 return sum;
             }
 
-            [[nodiscard]] Quantity cross(const NewOrder& taker, Listener& l) {
+            [[nodiscard]] Quantity cross(const NewOrder& taker, Listener& l, CancelTable& cancel_table_ref) {
                 Quantity remaining_qty {taker.qty};
                 // Check that book side is non-empty, the taker has quantity left, and that the taker's price still
                 // crosses the book if it's not a market order
@@ -141,6 +123,7 @@ namespace lob {
                         });
 
                         if (maker.qty.value == 0) {
+                            cancel_table_ref.erase(maker.id);
                             best_orders.pop_front();
                         }
                     }
@@ -153,6 +136,17 @@ namespace lob {
 
                 return remaining_qty;
             }
+
+            void cancel_order(Price price, OrderIt it) {
+                // PRE: levels.contains(price) && it is valid
+                auto level_it {levels.find(price)};
+                auto& level {level_it->second};
+
+                level.erase(it);
+                if (level.empty()) {
+                    levels.erase(level_it);
+                }
+            }
         private:
             [[nodiscard]] bool crosses(Price price) const {
                 std::optional best {get_best()};
@@ -160,12 +154,98 @@ namespace lob {
             }
 
             using Compare = std::conditional_t<S == Side::Buy, std::greater<Price>, std::less<Price>>;
-            std::map<Price, std::list<Order>, Compare> levels;
+            std::map<Price, OrderQueue, Compare> levels;
         };
+
+        void handle(const NewOrder &new_order) {
+            listener.on(OrderAck{
+                .side = new_order.side,
+                .qty = new_order.qty,
+                .seq = new_order.seq,
+                .id = new_order.id,
+                .price = new_order.price
+            });
+
+            // Cross the opposite side
+            Quantity remaining_qty {
+                new_order.side == Side::Buy ?
+                asks.cross(new_order, listener, cancel_table) :
+                bids.cross(new_order, listener, cancel_table)
+            };
+
+            // If there is not remaining quantity, we don't need to rest an order or cancel
+            if (remaining_qty.value == 0) {
+                return;
+            }
+
+            // If the order is IOC or Market, we cancel the order for the remaining quantity
+            if (!rests(new_order.tif)) {
+                listener.on(CancelAck{
+                    .side = new_order.side,
+                    .qty = remaining_qty,
+                    .seq = new_order.seq,
+                    .id = new_order.id,
+                    .price = new_order.price,
+                });
+                return;
+            }
+
+            // Otherwise, we proceed to rest the order
+            Order order = {.id = new_order.id, .qty = remaining_qty};
+
+            OrderIt order_it {
+                new_order.side == Side::Buy ? bids.add(new_order.price, order) : asks.add(new_order.price, order)
+            };
+
+            // Add this order to the cancel table
+            cancel_table.emplace(new_order.id, CancelTableEntry{
+                .side = new_order.side, .price = new_order.price, .it = order_it
+            });
+        }
+
+        void handle(const Cancel &cancel) {
+            // If the id lookup table doesn't contain the id we're trying to cancel, emit a rejection event and return
+            auto cancel_table_it = cancel_table.find(cancel.id);
+            if (cancel_table_it == cancel_table.end()) {
+                listener.on(CancelReject{
+                    .seq = cancel.seq,
+                    .id = cancel.id,
+                });
+                return;
+            }
+
+            // The id is in the lookup table, so fetch the side and price to access the correct list, and use the list
+            // iterator to erase the Order node from that list
+            auto [side, price, it] = cancel_table_it->second;
+
+            // Store qty for later CancelAck emit that happens after 'it' has been erased
+            Quantity qty {it->qty};
+
+            // Erase order from the book
+            if (side == Side::Buy) {
+                bids.cancel_order(price, it);
+            } else {
+                asks.cancel_order(price, it);
+            }
+
+            cancel_table.erase(cancel_table_it);
+
+            // Emit CancelAck event
+            listener.on(CancelAck{
+                .side = side,
+                .qty = qty,
+                .seq = cancel.seq,
+                .id = cancel.id,
+                .price = price
+            });
+        }
+
+        void handle(const Modify& /*modify*/) {}
 
         Listener& listener;
         BookSide<Side::Buy> bids;
         BookSide<Side::Sell> asks;
+        CancelTable cancel_table;
     };
 }
 

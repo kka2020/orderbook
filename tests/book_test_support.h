@@ -40,6 +40,10 @@ namespace lob {
             << " side=" << (e.side == Side::Buy ? "Buy" : "Sell")
             << " price=" << e.price.value << " qty=" << e.qty.value << "}";
     }
+
+    inline void PrintTo(const CancelReject& e, std::ostream* os) {
+        *os << "CancelReject{seq=" << e.seq.value << " id=" << e.id.value << "}";
+    }
 }
 
 namespace lob::test {
@@ -81,13 +85,17 @@ namespace lob::test {
         return new_order(Side::Sell, id, Price{0}, qty, TimeInForce::Market);
     }
 
+    inline Cancel cancel(OrderId id) {
+        return Cancel {.seq = SeqNo{1}, .id = id};
+    }
+
     inline Side opposite(Side side) {
         return side == Side::Buy ? Side::Sell : Side::Buy;
     }
 
     // Everything the book can emit, in emission order. One overload of on() per event type,
     // so the listener interface the book must call is spelled out here.
-    using Event = std::variant<OrderAck, Trade, CancelAck>;
+    using Event = std::variant<OrderAck, Trade, CancelAck, CancelReject>;
 
     struct RecordingListener {
         std::vector<Event> events;
@@ -95,10 +103,11 @@ namespace lob::test {
         void on(const OrderAck& e) { events.emplace_back(e); }
         void on(const Trade& e) { events.emplace_back(e); }
         void on(const CancelAck& e) { events.emplace_back(e); }
+        void on(const CancelReject& e) { events.emplace_back(e); }
     };
 
     // Shared fixture: a book wired to a RecordingListener.
-    // send() stamps increasing sequence numbers (1, 2, 3, ...) and returns the one it used,
+    // send() stamps increasing sequence numbers (1, 2, 3, ...) on any command and returns the one it used,
     // so tests can state which seq a Trade must carry. Tests use ids 10, 20, 30, ...
     // so that an id accidentally used as a seq (or vice versa) fails.
     template <typename Book>
@@ -107,10 +116,11 @@ namespace lob::test {
         RecordingListener listener;
         Book book{listener};
 
-        SeqNo send(NewOrder order) {
-            order.seq = SeqNo{next_seq_++};
-            book.apply(order);
-            return order.seq;
+        template <typename C>
+        SeqNo send(C command) {
+            command.seq = SeqNo{next_seq_++};
+            book.apply(command);
+            return command.seq;
         }
 
         // All recorded events of one type, in emission order.
@@ -127,6 +137,7 @@ namespace lob::test {
 
         [[nodiscard]] std::vector<Trade> trades() const { return events_of<Trade>(); }
         [[nodiscard]] std::vector<CancelAck> cancel_acks() const { return events_of<CancelAck>(); }
+        [[nodiscard]] std::vector<CancelReject> cancel_rejects() const { return events_of<CancelReject>(); }
 
     private:
         std::uint64_t next_seq_ {1};

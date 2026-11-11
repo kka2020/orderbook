@@ -38,6 +38,8 @@ namespace lob {
     // Quantity removed from the book or from an incoming order without trading.
     // For an IOC or market order: emitted after its Trades, qty = the unfilled remainder,
     // other fields copied from the order as submitted.
+    // For a Cancel of a resting order: seq = the Cancel's seq, qty = what was still resting,
+    // side and price = the resting order's.
     struct CancelAck {
         Side side;
         Quantity qty;
@@ -50,6 +52,18 @@ namespace lob {
 
     static_assert(sizeof(CancelAck) == 32);
     static_assert(std::is_trivially_copyable_v<CancelAck>);
+
+    // A Cancel for an id that is not resting right now: never seen, already fully filled,
+    // already cancelled, or an IOC/market order that never rested. The book is unchanged.
+    struct CancelReject {
+        SeqNo seq;
+        OrderId id;
+
+        constexpr bool operator==(const CancelReject&) const noexcept = default;
+    };
+
+    static_assert(sizeof(CancelReject) == 16);
+    static_assert(std::is_trivially_copyable_v<CancelReject>);
 }
 
 #endif //ORDERBOOK_EVENTS_H
