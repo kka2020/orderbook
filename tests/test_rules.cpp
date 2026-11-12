@@ -615,6 +615,89 @@ namespace lob::test {
         EXPECT_EQ(this->book.best_ask(), std::nullopt);
     }
 
+    // ---- Storage reuse: a removed order's memory may be handed to the next order ----
+    //
+    // A pooled book (v2 step 2 on) reuses the slot of a cancelled or filled order. Nothing of the
+    // old order may survive in it: not its place in a queue, not its id, price or side. And time
+    // priority must come from arrival order, never from which slot an order happened to get.
+
+    TYPED_TEST(RulesTest, ACancelledOrdersStorageKeepsNoTraceOfIt) {
+        this->send(buy(OrderId{10}, Price{100}, Quantity{5}));
+        this->send(cancel(OrderId{10}));
+        this->send(sell(OrderId{20}, Price{105}, Quantity{3}));  // may reuse id 10's storage
+
+        // No ghost of id 10 at 100: a sell at 100 finds no bid, so it rests instead of trading.
+        this->send(sell(OrderId{30}, Price{100}, Quantity{5}));
+        EXPECT_TRUE(this->trades().empty());
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+        EXPECT_EQ(this->book.depth_at(Price{100}, Side::Buy), 0u);
+
+        // id 10 is gone; id 20 is intact with its own fields.
+        this->send(cancel(OrderId{10}));
+        const SeqNo cancelled = this->send(cancel(OrderId{20}));
+        const std::vector<CancelAck> expected {
+            CancelAck{.side = Side::Buy, .qty = Quantity{5}, .seq = SeqNo{2}, .id = OrderId{10}, .price = Price{100}},
+            CancelAck{.side = Side::Sell, .qty = Quantity{3}, .seq = cancelled, .id = OrderId{20}, .price = Price{105}},
+        };
+        EXPECT_EQ(this->cancel_acks(), expected);
+        EXPECT_EQ(this->cancel_rejects().size(), 1u);
+    }
+
+    TYPED_TEST(RulesTest, AFilledOrdersStorageKeepsNoTraceOfIt) {
+        this->send(buy(OrderId{10}, Price{100}, Quantity{5}));
+        this->send(sell(OrderId{20}, Price{100}, Quantity{5}));  // fills id 10 completely
+        this->send(buy(OrderId{30}, Price{99}, Quantity{2}));    // may reuse id 10's storage
+
+        const SeqNo hit = this->send(sell(OrderId{40}, Price{99}, Quantity{2}));
+        const std::vector<Trade> expected {
+            Trade{.qty = Quantity{5}, .seq = SeqNo{2}, .maker_id = OrderId{10}, .taker_id = OrderId{20}, .price = Price{100}},
+            Trade{.qty = Quantity{2}, .seq = hit, .maker_id = OrderId{30}, .taker_id = OrderId{40}, .price = Price{99}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+    }
+
+    // Free storage is often handed out last-freed-first, so the three new orders below may get the
+    // old slots in reverse. They must still fill in the order they arrived.
+    TYPED_TEST(RulesTest, ReusedStorageDoesNotChangeTimePriority) {
+        this->send(buy(OrderId{10}, Price{100}, Quantity{1}));
+        this->send(buy(OrderId{20}, Price{100}, Quantity{1}));
+        this->send(buy(OrderId{30}, Price{100}, Quantity{1}));
+        this->send(cancel(OrderId{10}));
+        this->send(cancel(OrderId{20}));
+        this->send(cancel(OrderId{30}));
+
+        this->send(buy(OrderId{40}, Price{100}, Quantity{1}));
+        this->send(buy(OrderId{50}, Price{100}, Quantity{1}));
+        this->send(buy(OrderId{60}, Price{100}, Quantity{1}));
+        const SeqNo hit = this->send(sell(OrderId{70}, Price{100}, Quantity{3}));
+
+        const std::vector<Trade> expected {
+            Trade{.qty = Quantity{1}, .seq = hit, .maker_id = OrderId{40}, .taker_id = OrderId{70}, .price = Price{100}},
+            Trade{.qty = Quantity{1}, .seq = hit, .maker_id = OrderId{50}, .taker_id = OrderId{70}, .price = Price{100}},
+            Trade{.qty = Quantity{1}, .seq = hit, .maker_id = OrderId{60}, .taker_id = OrderId{70}, .price = Price{100}},
+        };
+        EXPECT_EQ(this->trades(), expected);
+    }
+
+    // Same, with storage freed by fills spread over two levels and refilled on the other side.
+    TYPED_TEST(RulesTest, StorageFreedByFillsServesTheOtherSideInArrivalOrder) {
+        this->send(buy(OrderId{10}, Price{100}, Quantity{1}));
+        this->send(buy(OrderId{20}, Price{99}, Quantity{1}));
+        this->send(sell(OrderId{30}, Price{99}, Quantity{2}));  // fills 10 then 20
+
+        this->send(sell(OrderId{40}, Price{105}, Quantity{1}));
+        this->send(sell(OrderId{50}, Price{105}, Quantity{1}));
+        const SeqNo hit = this->send(buy(OrderId{60}, Price{105}, Quantity{2}));
+
+        const std::vector<Trade> fills = this->trades();
+        ASSERT_EQ(fills.size(), 4u);
+        EXPECT_EQ(fills[2], (Trade{.qty = Quantity{1}, .seq = hit, .maker_id = OrderId{40}, .taker_id = OrderId{60}, .price = Price{105}}));
+        EXPECT_EQ(fills[3], (Trade{.qty = Quantity{1}, .seq = hit, .maker_id = OrderId{50}, .taker_id = OrderId{60}, .price = Price{105}}));
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+    }
+
     // ---- Modify: cancel + reinsert at the new price/quantity (loses time priority) ----
 
     TYPED_TEST(RulesTest, ModifyRepricesARestingOrderAndAcks) {

@@ -3,7 +3,7 @@
 // (best bid, best ask, and depth at the prices that matter for that step).
 //
 // The reference is v1 BaselineBook, verified VALID against the flash1 benchmark. Candidates are
-// listed in `Pairs` below: v2 FastBook at its default capacity and at a tiny one (to force growth).
+// listed in `Pairs` below: v2 FastBook at its default capacity and at capacity 1 (to force growth).
 // v1 vs v1 stays as a control, and the HarnessSelfTest cases prove the harness does catch a
 // candidate that diverges.
 //
@@ -198,10 +198,11 @@ namespace lob::test {
         using V1 = BaselineBook<RecordingListener>;
         using V2 = FastBook<RecordingListener>;
 
-        // v2 with a tiny capacity hint, so every stream overflows it many times and the growth
-        // path (pool / index / level storage resizing mid-run) is checked as hard as the normal one.
+        // v2 with a capacity hint of 1, so storage must grow from the very first orders and keeps
+        // growing as the book deepens: the growth path (pool / index / level storage resizing
+        // mid-run) is checked as hard as the normal one.
         struct TinyV2 : V2 {
-            explicit TinyV2(RecordingListener& l) : V2{l, 8} {}
+            explicit TinyV2(RecordingListener& l) : V2{l, 1} {}
         };
 
         using Pairs = ::testing::Types<Pair<V1, V1>, Pair<V1, V2>, Pair<V1, TinyV2>>;

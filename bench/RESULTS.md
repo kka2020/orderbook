@@ -6,6 +6,7 @@ How to reproduce:
 cmake --preset release && cmake --build --preset release
 taskset -c 2 build/release/bench/lob_latency 11      # latency + throughput, 11 rounds
 bench/cachegrind.sh                                   # instructions + simulated cache misses
+build/release/bench/lob_allocs                        # heap allocations per message
 ```
 
 ## Method
@@ -24,6 +25,9 @@ bench/cachegrind.sh                                   # instructions + simulated
 - **cachegrind**: 200,000 timed messages, counted only inside the replay (generation and prefill
   are excluded). Its counts come from a simulated cache, so they are identical on every run.
 - **Listener**: counts events only, so there is no I/O or allocation inside the timed region.
+- **Allocations** (`lob_allocs`): calls to `operator new` per message during the timed replay
+  (prefill excluded), from a separate binary that replaces `operator new`, so the counter never
+  touches the latency or cachegrind runs. Deterministic.
 
 ## Machine and caveats
 
@@ -47,6 +51,10 @@ orders are validated (zero qty, invalid price, duplicate live id) before matchin
 Throughput: **12.89 M msgs/s** (range 11.12–13.66).
 
 cachegrind, per message: **401 instructions, 5.36 L1d misses, 0.667 last-level data misses**.
+
+Heap allocations per message: new 1.903, cancel 0, modify 2.001, **1.036 overall** (one
+`std::list` node and one `std::unordered_map` node per resting order, plus a `std::map` node when
+a new price level appears).
 
 This is the baseline every v2 step is compared against. History: before validation was added
 (commit d57028e, 2026-11-11) v1 ran 387 instructions per message; the extra 14 come from the
@@ -110,9 +118,42 @@ Latency, 11 interleaved rounds (v1 in the same run in brackets):
 | cancel | 75 (81) | 179 (180) |
 | modify | 111 (135) | 237 (280) |
 
+Heap allocations per message: 1.036, identical to v1 (same containers; the reserve only
+pre-sizes the bucket array, which was already large enough).
+
 Throughput: 15.43 M msgs/s (v1: 13.18 in the same run). Step 0 and step 1 were measured in
 different runs, so their latencies are not compared directly; at ~2% of the instruction count the
 step 1 cost is below what this machine's latency can resolve.
+
+## v2 step 2: order pool + free list (2026-11-12)
+
+Orders move out of the `std::list` nodes into one `std::vector<Order>` pool, reused through a
+LIFO free list of 32-bit slot numbers. Each level is still a `std::list`, now of slot numbers; a
+small view (`PooledQueue`) presents it to `FifoPolicy` as a queue of orders.
+
+| | instructions | L1d misses | LL data misses | allocations |
+|---|---:|---:|---:|---:|
+| v1 | 401 | 5.36 | 0.667 | 1.036 |
+| v2 step 1 | 400 | 4.87 | 0.706 | 1.036 |
+| v2 step 2 | **411** | **4.93** | 0.706 | **1.036** |
+
+- **Allocations unchanged, as predicted**: every resting order still costs a list node and a
+  hash node. The pool only grows (rarely) past its reserved capacity.
+- **+11 instructions and slightly more L1 misses**: reaching an order now takes an extra hop (list
+  node → slot number → pool slot), and cancel/modify read the order through it.
+- This step on its own is a small regression. It is the setup for step 3, which puts the queue
+  links inside the pooled orders and removes the list (and its allocation) entirely.
+
+Latency, 11 interleaved rounds (v1 in the same run in brackets):
+
+| op | p50 ns | p99 ns |
+|---|---:|---:|
+| new | 51 (66) | 152 (174) |
+| cancel | 86 (92) | 262 (206) |
+| modify | 134 (154) | 352 (327) |
+
+Throughput: 14.42 M msgs/s (v1: 11.45 in the same run, a slow run overall). Cancel and modify
+tails are now worse than v1 in the same run, consistent with the extra hop on those paths.
 
 For context, v1 also passes the flash1 benchmark on all five scenarios (`flash1/run.sh`), at
 about 9–10 M msgs/s on that workload, which differs from this one.
