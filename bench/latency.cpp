@@ -2,7 +2,7 @@
 //
 //   lob_latency [rounds] [messages]          default: 11 rounds, 1,000,000 messages
 //   taskset -c 2 lob_latency                  pin to one CPU (best effort under WSL)
-//   lob_latency --replay-once [messages]      one untimed replay, for cachegrind.sh
+//   lob_latency --replay-once v1|v2 [messages]  one untimed replay of one book, for cachegrind.sh
 //
 // Each round, for each book type in turn (so a slow phase of the machine hits every book alike):
 //   1. latency pass:    fresh book, apply the untimed prefill, then time every timed message
@@ -40,6 +40,7 @@
 
 #include "lob/baseline.h"
 #include "lob/concepts.h"
+#include "lob/fast_book.h"
 #include "workload.h"
 
 namespace {
@@ -59,15 +60,20 @@ namespace {
         void on(const lob::CancelReject&) noexcept { ++cancel_rejects; }
         void on(const lob::ModifyAck&) noexcept { ++modify_acks; }
         void on(const lob::ModifyReject&) noexcept { ++modify_rejects; }
+
+        bool operator==(const CountingListener&) const = default;
     };
 
-    // Every book under test. Adding v2 later: one more entry here, plus a name in book_name().
+    // Every book under test.
     using V1 = lob::BaselineBook<CountingListener>;
+    using V2 = lob::FastBook<CountingListener>;
 
     template <typename Book>
     constexpr const char* book_name() {
         if constexpr (std::is_same_v<Book, V1>) {
             return "v1 BaselineBook";
+        } else if constexpr (std::is_same_v<Book, V2>) {
+            return "v2 FastBook";
         } else {
             return "?";
         }
@@ -292,12 +298,23 @@ namespace {
 int main(int argc, char** argv) {
     lob::bench::WorkloadConfig cfg;
 
+    // One book per process: cachegrind's counters cover everything between the markers, so
+    // replaying two books in one run would add their counts together.
     if (argc >= 2 && std::string_view{argv[1]} == "--replay-once") {
-        if (argc >= 3) {
-            cfg.messages = parse_count(argv[2]);
+        const std::string_view book = argc >= 3 ? argv[2] : "";
+        if (book != "v1" && book != "v2") {
+            std::fprintf(stderr, "usage: lob_latency --replay-once v1|v2 [messages]\n");
+            return 2;
+        }
+        if (argc >= 4) {
+            cfg.messages = parse_count(argv[3]);
         }
         const Workload w = lob::bench::make_workload(cfg);
-        run_replay_once<V1>(w);
+        if (book == "v1") {
+            run_replay_once<V1>(w);
+        } else {
+            run_replay_once<V2>(w);
+        }
         return 0;
     }
 
@@ -313,13 +330,23 @@ int main(int argc, char** argv) {
                 ticks_per_ns, static_cast<unsigned long long>(overhead), w.prefill.size(),
                 static_cast<unsigned long long>(cfg.seed));
 
+    // Interleaved: v1 then v2 in every round, so a slow phase of the machine hits both alike.
     std::vector<RoundResult> v1;
+    std::vector<RoundResult> v2;
     for (std::size_t i = 0; i < rounds; ++i) {
         v1.push_back(run_round<V1>(w, overhead, ticks_per_ns));
-        // v2: interleave here, e.g. v2.push_back(run_round<V2>(w, overhead, ticks_per_ns));
+        v2.push_back(run_round<V2>(w, overhead, ticks_per_ns));
+    }
+
+    // Cheap sanity check that both books did the same work (the differential test is the real
+    // check): a faster v2 that emits different events would be a meaningless comparison.
+    if (!(v1.front().counts == v2.front().counts)) {
+        std::fprintf(stderr, "v1 and v2 emitted different event counts on this workload: results are not comparable\n");
+        return 1;
     }
 
     print_mix(v1.front(), w);
     print_book<V1>(v1);
+    print_book<V2>(v2);
     return 0;
 }

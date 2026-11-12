@@ -34,6 +34,18 @@ namespace lob {
         l.on(modify_ack);
         l.on(modify_reject);
     };
+
+    template <typename L>
+    concept FifoLevel = requires(L& level) {
+        { level.empty() } -> std::same_as<bool>;
+        { level.front().qty } -> std::same_as<Quantity&>; // Can get front order and from there access qty
+        level.pop_front();
+    };
+
+    template <typename P, typename L>
+    concept MatchPolicyFor = requires(L& level, Quantity qty) {
+        { P::fill_level(level, qty, [](auto&, Quantity) {}) } -> std::same_as<Quantity>;
+    };
 }
 
 #endif //ORDERBOOK_CONCEPTS_H

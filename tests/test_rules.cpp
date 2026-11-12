@@ -6,12 +6,13 @@
 
 #include "book_test_support.h"
 #include "lob/baseline.h"
+#include "lob/fast_book.h"
 
 namespace lob::test {
     template <typename Book>
     class RulesTest : public BookTest<Book> {};
 
-    using BookTypes = ::testing::Types<BaselineBook<RecordingListener>>;
+    using BookTypes = ::testing::Types<BaselineBook<RecordingListener>, FastBook<RecordingListener>>;
     TYPED_TEST_SUITE(RulesTest, BookTypes);
 
     // ---- Resting orders and best bid/ask ----
@@ -980,8 +981,10 @@ namespace lob::test {
 
     struct BaselineBuy : OnSide<BaselineBook<RecordingListener>, Side::Buy> {};
     struct BaselineSell : OnSide<BaselineBook<RecordingListener>, Side::Sell> {};
+    struct FastBuy : OnSide<FastBook<RecordingListener>, Side::Buy> {};
+    struct FastSell : OnSide<FastBook<RecordingListener>, Side::Sell> {};
 
-    using SidedBookTypes = ::testing::Types<BaselineBuy, BaselineSell>;
+    using SidedBookTypes = ::testing::Types<BaselineBuy, BaselineSell, FastBuy, FastSell>;
 
     TYPED_TEST_SUITE(SidedRulesTest, SidedBookTypes);
 

@@ -2,9 +2,10 @@
 // and after EVERY command check that both emitted identical events and agree on the book state
 // (best bid, best ask, and depth at the prices that matter for that step).
 //
-// The reference is v1 BaselineBook, verified VALID against the flash1 benchmark. Candidates go in
-// `Pairs` below; v2 FastBook will be added there. Until then v1 is checked against itself, and
-// the HarnessSelfTest cases prove the harness does catch a candidate that diverges.
+// The reference is v1 BaselineBook, verified VALID against the flash1 benchmark. Candidates are
+// listed in `Pairs` below: v2 FastBook at its default capacity and at a tiny one (to force growth).
+// v1 vs v1 stays as a control, and the HarnessSelfTest cases prove the harness does catch a
+// candidate that diverges.
 //
 // Two kinds of stream:
 //   - adversarial: few ids and a narrow price band, so ids are reused, duplicated and cancelled
@@ -25,6 +26,7 @@
 
 #include "book_test_support.h"
 #include "lob/baseline.h"
+#include "lob/fast_book.h"
 #include "workload.h"
 
 namespace lob::test {
@@ -167,8 +169,15 @@ namespace lob::test {
 #endif
 
         using V1 = BaselineBook<RecordingListener>;
-        // v2: add Pair<V1, FastBook<RecordingListener>> here.
-        using Pairs = ::testing::Types<Pair<V1, V1>>;
+        using V2 = FastBook<RecordingListener>;
+
+        // v2 with a tiny capacity hint, so every stream overflows it many times and the growth
+        // path (pool / index / level storage resizing mid-run) is checked as hard as the normal one.
+        struct TinyV2 : V2 {
+            explicit TinyV2(RecordingListener& l) : V2{l, 8} {}
+        };
+
+        using Pairs = ::testing::Types<Pair<V1, V1>, Pair<V1, V2>, Pair<V1, TinyV2>>;
         TYPED_TEST_SUITE(DifferentialTest, Pairs);
 
         TYPED_TEST(DifferentialTest, AdversarialStreamsMatch) {

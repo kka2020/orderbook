@@ -17,7 +17,7 @@ bench/cachegrind.sh                                   # instructions + simulated
   real equity feeds. Every cancel and modify targets a live order (the generator tracks fills
   through a shadow v1 book), so there are no stale rejects.
 - **Latency**: each message is timed with `lfence; rdtsc` ... `rdtscp; lfence`. The median cost of an
-  empty timer pair (~38 TSC ticks; the TSC runs at a fixed ~2.67 GHz, independent of turbo) is subtracted. Each cell below is the median across 11 rounds, with
+  empty timer pair (~40 TSC ticks; the TSC runs at a fixed rate, measured at ~2.6 GHz, independent of turbo) is subtracted. Each cell below is the median across 11 rounds, with
   the min–max across rounds in brackets. Every round uses a fresh book. Sample buffers are
   written once before timing, so no page faults occur during the timed loop.
 - **Throughput**: a separate replay per round under a single timer (no per-message timers).
@@ -33,19 +33,55 @@ and E-cores, and turbo/thermal state varies. That is the reason for the wide min
 the absolute numbers as indicative; the meaningful comparisons are relative (v2 vs v1, same
 workload, interleaved rounds) and the deterministic cachegrind counts.
 
-## v1 `BaselineBook` (2026-11-11)
+## v1 `BaselineBook` (2026-11-12, with input validation)
 
-`std::map` of price levels → `std::list<Order>` per level, `std::unordered_map` id index.
+`std::map` of price levels → `std::list<Order>` per level, `std::unordered_map` id index. New
+orders are validated (zero qty, invalid price, duplicate live id) before matching.
 
 | op | p50 ns | p90 ns | p99 ns | p99.9 ns |
 |---|---:|---:|---:|---:|
-| new | 54 (51–61) | 85 (79–116) | 153 (137–197) | 307 (293–400) |
-| cancel | 77 (73–87) | 108 (101–156) | 192 (171–239) | 367 (316–455) |
-| modify | 130 (125–147) | 185 (173–254) | 305 (268–389) | 566 (473–713) |
+| new | 55 (53–65) | 93 (87–129) | 158 (147–238) | 303 (265–455) |
+| cancel | 78 (75–90) | 108 (101–167) | 184 (157–279) | 371 (268–573) |
+| modify | 132 (125–149) | 184 (171–272) | 280 (247–446) | 557 (439–898) |
 
-Throughput: **13.16 M msgs/s** (range 11.34–13.84).
+Throughput: **12.89 M msgs/s** (range 11.12–13.66).
 
-cachegrind, per message: **387 instructions, 5.35 L1d misses, 0.667 last-level data misses**.
+cachegrind, per message: **401 instructions, 5.36 L1d misses, 0.667 last-level data misses**.
+
+This is the baseline every v2 step is compared against. History: before validation was added
+(commit d57028e, 2026-11-11) v1 ran 387 instructions per message; the extra 14 come from the
+new checks, most likely dominated by the duplicate-id hash lookup. Its latency moved by less than the round-to-round spread.
+
+## v2 `FastBook`, step 0: same containers, new structure (2026-11-12)
+
+Same data structures as v1. New-order handling is split into `validate → ack → match →
+after_match`; the per-level fill loop moved into a `FifoPolicy` template parameter (called with a
+lambda); the id table is `reserve`d to the capacity hint (65,536) at construction.
+
+cachegrind, per message (v1 in brackets):
+
+| build | instructions | L1d misses | LL data misses |
+|---|---:|---:|---:|
+| step 0 as committed | 393 (401) | 4.85 (5.36) | 0.706 (0.667) |
+| step 0 with the `reserve` line removed | **401** (401) | **5.36** (5.36) | **0.667** (0.667) |
+
+- **The new structure costs nothing**: without the `reserve`, the counts match v1 exactly. The
+  policy template and its lambda are inlined away at `-O3`.
+- **All of the difference comes from the `reserve`.** With 65,536 buckets for ~5,000 live orders, hash
+  chains are shorter (fewer instructions and L1 misses), but the bucket array is larger (512 KB),
+  which most likely explains the slightly higher last-level misses. Not yet verified beyond these counts.
+
+Latency, 11 interleaved rounds in the same run (v1 in the same run in brackets; that run was slower
+overall than the v1 baseline above, so compare within the run only):
+
+| op | p50 ns | p99 ns |
+|---|---:|---:|
+| new | 47 (63) | 143 (187) |
+| cancel | 82 (88) | 230 (208) |
+| modify | 125 (148) | 302 (313) |
+
+Throughput: 13.92 M msgs/s (v1: 11.49 in the same run). The ranges overlap for cancel and modify;
+new orders are clearly faster, consistent with the shorter hash chains on the insert path.
 
 For context, v1 also passes the flash1 benchmark on all five scenarios (`flash1/run.sh`), at
 about 9–10 M msgs/s on that workload, which differs from this one.
