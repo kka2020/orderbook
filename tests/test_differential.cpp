@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <variant>
@@ -34,9 +35,11 @@ namespace lob::test {
 
         // ---- streams ------------------------------------------------------------------------------
 
+        constexpr std::int64_t adversarial_lo = 95, adversarial_hi = 105;
+
         std::vector<Command> adversarial_stream(std::uint64_t seed, std::size_t count) {
             bench::Rng rng {seed};
-            constexpr std::int64_t lo = 95, hi = 105;  // narrow band: orders cross all the time
+            constexpr std::int64_t lo = adversarial_lo, hi = adversarial_hi;  // narrow band: orders cross all the time
             constexpr std::uint32_t ids = 64;          // small id space: constant reuse and duplicates
 
             auto price = [&]() -> Price {
@@ -68,6 +71,15 @@ namespace lob::test {
             return out;
         }
 
+        // Every valid price of the adversarial band, for a full-book depth sweep.
+        std::vector<Price> adversarial_prices() {
+            std::vector<Price> out;
+            for (std::int64_t p = adversarial_lo; p <= adversarial_hi; ++p) {
+                out.push_back(Price{p});
+            }
+            return out;
+        }
+
         std::vector<Command> realistic_stream(std::uint64_t seed, std::size_t count) {
             bench::WorkloadConfig cfg;
             cfg.seed = seed;
@@ -95,8 +107,13 @@ namespace lob::test {
         // every command; depth only after every `depth_every`-th one, because v1 sums a level's queue
         // on demand and the realistic book has ~1,250 orders at each best level. A wrong depth
         // persists in the book state, so it is still caught at the next sampled command.
+        //
+        // Depth is probed at the best bid, best ask and the command's price, plus every price in
+        // `sweep` (both sides). The sweep catches a stale total at a level deep in the book on the
+        // command that corrupts it, not only once that level reaches the top or is traded.
         template <typename Ref, typename Cand>
-        std::optional<std::string> first_divergence(const std::vector<Command>& stream, std::size_t depth_every = 1) {
+        std::optional<std::string> first_divergence(const std::vector<Command>& stream, std::size_t depth_every = 1,
+                                                    std::span<const Price> sweep = {}) {
             RecordingListener ref_events;
             RecordingListener cand_events;
             Ref ref {ref_events};
@@ -129,18 +146,28 @@ namespace lob::test {
                     cand_events.events.clear();
                     continue;
                 }
-                for (const std::optional<Price>& probe : {ref.best_bid(), ref.best_ask(), command_price(c)}) {
-                    if (!probe) {
-                        continue;
-                    }
+                auto depth_mismatch = [&](Price probe) -> std::optional<std::string> {
                     for (const Side s : {Side::Buy, Side::Sell}) {
-                        const std::uint64_t want = ref.depth_at(*probe, s);
-                        const std::uint64_t got = cand.depth_at(*probe, s);
+                        const std::uint64_t want = ref.depth_at(probe, s);
+                        const std::uint64_t got = cand.depth_at(probe, s);
                         if (got != want) {
-                            return report("depth_at(" + std::to_string(probe->value) + ", " + ::testing::PrintToString(s) +
+                            return report("depth_at(" + std::to_string(probe.value) + ", " + ::testing::PrintToString(s) +
                                           ") differs: reference " + std::to_string(want) + ", candidate " +
                                           std::to_string(got));
                         }
+                    }
+                    return std::nullopt;
+                };
+                for (const std::optional<Price>& probe : {ref.best_bid(), ref.best_ask(), command_price(c)}) {
+                    if (probe) {
+                        if (auto m = depth_mismatch(*probe)) {
+                            return m;
+                        }
+                    }
+                }
+                for (const Price probe : sweep) {
+                    if (auto m = depth_mismatch(probe)) {
+                        return m;
                     }
                 }
                 ref_events.events.clear();
@@ -183,8 +210,9 @@ namespace lob::test {
         TYPED_TEST(DifferentialTest, AdversarialStreamsMatch) {
             using Ref = typename TypeParam::Ref;
             using Cand = typename TypeParam::Cand;
+            const std::vector<Price> sweep = adversarial_prices();  // 11 prices: cheap in a tiny book
             for (std::uint64_t seed = 1; seed <= 5; ++seed) {
-                const auto divergence = first_divergence<Ref, Cand>(adversarial_stream(seed, stream_length));
+                const auto divergence = first_divergence<Ref, Cand>(adversarial_stream(seed, stream_length), 1, sweep);
                 EXPECT_EQ(divergence, std::nullopt) << "adversarial seed " << seed;
             }
         }
@@ -258,8 +286,28 @@ namespace lob::test {
             }
         };
 
+        // v1 with correct events, but from the 500th command on depth_at over-reports one unit at
+        // bid price 95 whenever 95 is NOT the best bid: a stale total deep in the book.
+        struct WrongDeepDepthBook {
+            V1 inner;
+            std::size_t applied = 0;
+            explicit WrongDeepDepthBook(RecordingListener& listener) : inner{listener} {}
+            void apply(const Command& c) {
+                inner.apply(c);
+                ++applied;
+            }
+            [[nodiscard]] std::optional<Price> best_bid() const noexcept { return inner.best_bid(); }
+            [[nodiscard]] std::optional<Price> best_ask() const noexcept { return inner.best_ask(); }
+            [[nodiscard]] std::uint64_t depth_at(Price p, Side s) const noexcept {
+                const std::uint64_t d = inner.depth_at(p, s);
+                const bool skewed = applied >= 500 && s == Side::Buy && p == Price{95} && inner.best_bid() != p;
+                return skewed ? d + 1 : d;
+            }
+        };
+
         static_assert(OrderBookLike<ExtraEventBook>);
         static_assert(OrderBookLike<WrongDepthBook>);
+        static_assert(OrderBookLike<WrongDeepDepthBook>);
 
         TEST(DifferentialHarnessSelfTest, CatchesAnExtraEvent) {
             const auto divergence = first_divergence<V1, ExtraEventBook>(adversarial_stream(1, 2'000));
@@ -273,6 +321,15 @@ namespace lob::test {
             ASSERT_TRUE(divergence.has_value());
             EXPECT_NE(divergence->find("command #"), std::string::npos) << *divergence;
             EXPECT_NE(divergence->find("depth_at("), std::string::npos) << *divergence;
+        }
+
+        // With the sweep, a stale total deep in the book is caught on the very command it starts.
+        TEST(DifferentialHarnessSelfTest, SweepCatchesWrongDepthDeepInTheBookImmediately) {
+            const std::vector<Price> sweep = adversarial_prices();
+            const auto divergence = first_divergence<V1, WrongDeepDepthBook>(adversarial_stream(1, 2'000), 1, sweep);
+            ASSERT_TRUE(divergence.has_value());
+            EXPECT_NE(divergence->find("command #499"), std::string::npos) << *divergence;
+            EXPECT_NE(divergence->find("depth_at(95, Buy)"), std::string::npos) << *divergence;
         }
     }
 }

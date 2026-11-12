@@ -83,5 +83,36 @@ overall than the v1 baseline above, so compare within the run only):
 Throughput: 13.92 M msgs/s (v1: 11.49 in the same run). The ranges overlap for cancel and modify;
 new orders are clearly faster, consistent with the shorter hash chains on the insert path.
 
+## v2 step 1: cached level totals (2026-11-12)
+
+Each price level stores its total resting quantity, updated on rest, fill and cancel, so
+`depth_at` reads one number instead of summing the level's queue (O(1) instead of O(orders)).
+
+cachegrind, per message:
+
+| | instructions | L1d misses | LL data misses |
+|---|---:|---:|---:|
+| v1 | 401 | 5.36 | 0.667 |
+| v2 step 0 | 393 | 4.85 | 0.706 |
+| v2 step 1 | **400** | 4.87 | 0.706 |
+
+- **Cost: +7 instructions per message** over step 0 (the extra add/subtract on every rest, fill
+  and cancel, plus the wider level record). Cache behaviour is unchanged.
+- **Benefit: not visible here.** This workload never calls `depth_at`; the gain is for callers that
+  query depth (a market-data publisher would after every update). The trade is a small fixed cost
+  per update in exchange for a constant-time depth query.
+
+Latency, 11 interleaved rounds (v1 in the same run in brackets):
+
+| op | p50 ns | p99 ns |
+|---|---:|---:|
+| new | 43 (59) | 118 (165) |
+| cancel | 75 (81) | 179 (180) |
+| modify | 111 (135) | 237 (280) |
+
+Throughput: 15.43 M msgs/s (v1: 13.18 in the same run). Step 0 and step 1 were measured in
+different runs, so their latencies are not compared directly; at ~2% of the instruction count the
+step 1 cost is below what this machine's latency can resolve.
+
 For context, v1 also passes the flash1 benchmark on all five scenarios (`flash1/run.sh`), at
 about 9–10 M msgs/s on that workload, which differs from this one.

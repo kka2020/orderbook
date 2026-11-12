@@ -59,6 +59,11 @@ namespace lob {
         static_assert(MatchPolicyFor<MatchPolicy, OrderQueue>,
              "MatchPolicy must provide static Quantity fill_level(Level&, Quantity, on_fill) for this book's Level");
 
+        struct Level {
+            OrderQueue orders;
+            std::uint64_t total {0};
+        };
+
         using OrderIt = OrderQueue::iterator;
 
         struct OrderIdHash {
@@ -89,8 +94,11 @@ namespace lob {
 
             OrderIt add(Price price, Order order) {
                 auto [level_it, _] = levels.try_emplace(price);
-                auto& queue {level_it->second};
+
+                auto& [queue, total] {level_it->second};
                 auto order_it = queue.insert(queue.end(), order);
+                total += order.qty.value;
+
                 return order_it;
             }
 
@@ -100,13 +108,7 @@ namespace lob {
                     return 0;
                 }
 
-                const auto& orders {level_it->second};
-                std::uint64_t sum {0};
-                for (const auto& order : orders) {
-                    sum += order.qty.value;
-                }
-
-                return sum;
+                return level_it->second.total;
             }
 
             [[nodiscard]] Quantity cross(const NewOrder& taker, Listener& l, IdTable& id_table_ref) {
@@ -115,10 +117,10 @@ namespace lob {
                 // crosses the book if it's not a market order
                 while (!levels.empty() && (is_market(taker.tif) || crosses(taker.price)) && remaining_qty.value > 0) {
                     // We already check that levels is non-empty, so this is safe
-                    auto level {levels.begin()};
-                    auto& [price, best_orders] = *level;
+                    auto level_it {levels.begin()};
+                    auto& [price, level] = *level_it;
 
-                    remaining_qty = MatchPolicy::fill_level(best_orders, remaining_qty, [&](Order& maker, Quantity fill_qty) {
+                    remaining_qty = MatchPolicy::fill_level(level.orders, remaining_qty, [&](Order& maker, Quantity fill_qty) {
                         l.on(Trade{
                             .qty = fill_qty,
                             .seq = taker.seq,
@@ -127,14 +129,16 @@ namespace lob {
                             .price = price,
                         });
 
+                        level.total -= fill_qty.value;
+
                         if (maker.qty.value == 0) {
                             id_table_ref.erase(maker.id);
                         }
                     });
 
                     // If level is now empty, delete it
-                    if (best_orders.empty()) {
-                        levels.erase(level);
+                    if (level.orders.empty()) {
+                        levels.erase(level_it);
                     }
                 }
 
@@ -146,8 +150,11 @@ namespace lob {
                 auto level_it {levels.find(price)};
                 auto& level {level_it->second};
 
-                level.erase(it);
-                if (level.empty()) {
+                // Reduce level.total before iterator is deleted
+                level.total -= it->qty.value;
+
+                level.orders.erase(it);
+                if (level.orders.empty()) {
                     levels.erase(level_it);
                 }
             }
@@ -158,7 +165,7 @@ namespace lob {
             }
 
             using Compare = std::conditional_t<S == Side::Buy, std::greater<Price>, std::less<Price>>;
-            std::map<Price, OrderQueue, Compare> levels;
+            std::map<Price, Level, Compare> levels;
         };
 
         struct MatchResult {

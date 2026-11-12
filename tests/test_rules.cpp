@@ -1038,4 +1038,172 @@ namespace lob::test {
         // Widen before multiplying: 2u * UINT32_MAX is computed in 32 bits and wraps to 4294967294.
         EXPECT_EQ(this->book.depth_at(Price{0}, this->side), std::uint64_t{2} * UINT32_MAX);
     }
+
+    // ---- depth_at after the book changes, run once per side ----
+    //
+    // These pin down every way a level's quantity can change, so a cached per-level total (v2
+    // step 1) is checked after each one: a fill (partial and full), a sweep through several levels,
+    // a cancel, a modify (to another level, to the same level, after a partial fill), a level that
+    // empties and is created again, and the cases that must NOT change depth (rejects, IOC and
+    // market remainders). `this->side` is the side resting in the book; the aggressor is opposite.
+
+    // A price k ticks behind p on side s, i.e. further from the touch: lower for bids, higher for asks.
+    inline Price behind(Side s, Price p, std::int64_t k) {
+        return Price{s == Side::Buy ? p.value - k : p.value + k};
+    }
+
+    TYPED_TEST(SidedRulesTest, DepthDropsByTheFillOnAPartialFillOfTheMaker) {
+        const Side s = this->side;
+        this->send(new_order(s, OrderId{10}, Price{100}, Quantity{10}));
+        this->send(new_order(opposite(s), OrderId{20}, Price{100}, Quantity{4}));
+
+        EXPECT_EQ(this->book.depth_at(Price{100}, s), 6u);
+    }
+
+    TYPED_TEST(SidedRulesTest, DepthKeepsTheRestOfTheLevelWhenTheFrontMakerIsFullyFilled) {
+        const Side s = this->side;
+        this->send(new_order(s, OrderId{10}, Price{100}, Quantity{5}));
+        this->send(new_order(s, OrderId{20}, Price{100}, Quantity{7}));
+        this->send(new_order(opposite(s), OrderId{30}, Price{100}, Quantity{5}));
+
+        EXPECT_EQ(this->book.depth_at(Price{100}, s), 7u);
+    }
+
+    TYPED_TEST(SidedRulesTest, DepthIsZeroAfterTheLevelIsFilledAway) {
+        const Side s = this->side;
+        this->send(new_order(s, OrderId{10}, Price{100}, Quantity{5}));
+        this->send(new_order(opposite(s), OrderId{20}, Price{100}, Quantity{5}));
+
+        EXPECT_EQ(this->book.depth_at(Price{100}, s), 0u);
+    }
+
+    TYPED_TEST(SidedRulesTest, DepthOfEachLevelDropsInASweepThroughSeveralLevels) {
+        const Side s = this->side;
+        const Price p0 {100};
+        const Price p1 = behind(s, p0, 1);
+        const Price p2 = behind(s, p0, 2);
+        this->send(new_order(s, OrderId{10}, p0, Quantity{5}));
+        this->send(new_order(s, OrderId{20}, p1, Quantity{5}));
+        this->send(new_order(s, OrderId{30}, p2, Quantity{5}));
+
+        // Limit price p1: takes all of p0 and 3 of p1, and stops before p2.
+        this->send(new_order(opposite(s), OrderId{40}, p1, Quantity{8}));
+
+        EXPECT_EQ(this->book.depth_at(p0, s), 0u);
+        EXPECT_EQ(this->book.depth_at(p1, s), 2u);
+        EXPECT_EQ(this->book.depth_at(p2, s), 5u);
+    }
+
+    TYPED_TEST(SidedRulesTest, DepthOfEachLevelDropsInAMarketOrderSweep) {
+        const Side s = this->side;
+        const Price p0 {100};
+        const Price p1 = behind(s, p0, 1);
+        this->send(new_order(s, OrderId{10}, p0, Quantity{5}));
+        this->send(new_order(s, OrderId{20}, p1, Quantity{5}));
+
+        this->send(new_order(opposite(s), OrderId{30}, Price{0}, Quantity{7}, TimeInForce::Market));
+
+        EXPECT_EQ(this->book.depth_at(p0, s), 0u);
+        EXPECT_EQ(this->book.depth_at(p1, s), 3u);
+    }
+
+    TYPED_TEST(SidedRulesTest, AnAggressorThatRestsAddsOnlyItsUnfilledRemainder) {
+        const Side s = this->side;
+        this->send(new_order(s, OrderId{10}, Price{100}, Quantity{3}));
+        this->send(new_order(opposite(s), OrderId{20}, Price{100}, Quantity{10}));
+
+        EXPECT_EQ(this->book.depth_at(Price{100}, opposite(s)), 7u);
+        EXPECT_EQ(this->book.depth_at(Price{100}, s), 0u);
+    }
+
+    TYPED_TEST(SidedRulesTest, AnIocRemainderAddsNoDepth) {
+        const Side s = this->side;
+        this->send(new_order(s, OrderId{10}, Price{100}, Quantity{3}));
+        this->send(new_order(opposite(s), OrderId{20}, Price{100}, Quantity{10}, TimeInForce::IOC));
+
+        EXPECT_EQ(this->book.depth_at(Price{100}, opposite(s)), 0u);
+    }
+
+    TYPED_TEST(SidedRulesTest, CancelAfterAPartialFillRemovesOnlyWhatWasLeft) {
+        const Side s = this->side;
+        this->send(new_order(s, OrderId{10}, Price{100}, Quantity{10}));
+        this->send(new_order(s, OrderId{20}, Price{100}, Quantity{5}));
+        this->send(new_order(opposite(s), OrderId{30}, Price{100}, Quantity{4}));  // id 10 has 6 left
+
+        this->send(cancel(OrderId{10}));
+
+        EXPECT_EQ(this->book.depth_at(Price{100}, s), 5u);
+    }
+
+    TYPED_TEST(SidedRulesTest, ModifyToAnotherPriceMovesTheQuantityBetweenLevels) {
+        const Side s = this->side;
+        const Price p0 {100};
+        const Price p1 = behind(s, p0, 1);
+        this->send(new_order(s, OrderId{10}, p0, Quantity{5}));
+        this->send(new_order(s, OrderId{20}, p0, Quantity{7}));
+
+        this->send(modify(OrderId{10}, s, p1, Quantity{9}));
+
+        EXPECT_EQ(this->book.depth_at(p0, s), 7u);
+        EXPECT_EQ(this->book.depth_at(p1, s), 9u);
+    }
+
+    TYPED_TEST(SidedRulesTest, ModifyAtTheSamePriceReplacesTheQuantity) {
+        const Side s = this->side;
+        this->send(new_order(s, OrderId{10}, Price{100}, Quantity{5}));
+        this->send(new_order(s, OrderId{20}, Price{100}, Quantity{7}));
+
+        this->send(modify(OrderId{10}, s, Price{100}, Quantity{2}));
+
+        EXPECT_EQ(this->book.depth_at(Price{100}, s), 9u);
+    }
+
+    TYPED_TEST(SidedRulesTest, ModifyAfterAPartialFillReplacesWhatWasLeft) {
+        const Side s = this->side;
+        this->send(new_order(s, OrderId{10}, Price{100}, Quantity{10}));
+        this->send(new_order(opposite(s), OrderId{20}, Price{100}, Quantity{4}));  // id 10 has 6 left
+
+        this->send(modify(OrderId{10}, s, Price{100}, Quantity{8}));
+
+        EXPECT_EQ(this->book.depth_at(Price{100}, s), 8u);
+    }
+
+    TYPED_TEST(SidedRulesTest, RejectedModifiesLeaveDepthUnchanged) {
+        const Side s = this->side;
+        this->send(new_order(s, OrderId{10}, Price{100}, Quantity{5}));
+
+        this->send(modify(OrderId{10}, opposite(s), Price{100}, Quantity{9}));  // wrong side
+        this->send(modify(OrderId{10}, s, Price{100}, Quantity{0}));            // zero quantity
+        this->send(modify(OrderId{99}, s, Price{100}, Quantity{9}));            // unknown id
+
+        EXPECT_EQ(this->modify_rejects().size(), 3u);
+        EXPECT_EQ(this->book.depth_at(Price{100}, s), 5u);
+    }
+
+    TYPED_TEST(SidedRulesTest, ARejectedDuplicateIdAddsNoDepth) {
+        const Side s = this->side;
+        this->send(new_order(s, OrderId{10}, Price{100}, Quantity{5}));
+        this->send(new_order(s, OrderId{10}, Price{100}, Quantity{7}));
+
+        EXPECT_EQ(this->order_rejects().size(), 1u);
+        EXPECT_EQ(this->book.depth_at(Price{100}, s), 5u);
+    }
+
+    TYPED_TEST(SidedRulesTest, ALevelCreatedAgainAfterACancelEmptiedItStartsFromZero) {
+        const Side s = this->side;
+        this->send(new_order(s, OrderId{10}, Price{100}, Quantity{5}));
+        this->send(cancel(OrderId{10}));
+        this->send(new_order(s, OrderId{20}, Price{100}, Quantity{3}));
+
+        EXPECT_EQ(this->book.depth_at(Price{100}, s), 3u);
+    }
+
+    TYPED_TEST(SidedRulesTest, ALevelCreatedAgainAfterBeingFilledAwayStartsFromZero) {
+        const Side s = this->side;
+        this->send(new_order(s, OrderId{10}, Price{100}, Quantity{5}));
+        this->send(new_order(opposite(s), OrderId{20}, Price{100}, Quantity{5}));
+        this->send(new_order(s, OrderId{30}, Price{100}, Quantity{3}));
+
+        EXPECT_EQ(this->book.depth_at(Price{100}, s), 3u);
+    }
 }
