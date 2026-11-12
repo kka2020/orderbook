@@ -69,6 +69,33 @@ namespace lob {
     inline void PrintTo(const ModifyReject& e, std::ostream* os) {
         *os << "ModifyReject{seq=" << e.seq.value << " id=" << e.id.value << "}";
     }
+
+    // Command printers, so a differential-test failure can show the command that diverged.
+    inline void PrintTo(TimeInForce tif, std::ostream* os) {
+        switch (tif) {
+            case TimeInForce::GTC: *os << "GTC"; return;
+            case TimeInForce::IOC: *os << "IOC"; return;
+            case TimeInForce::Market: *os << "Market"; return;
+        }
+        *os << "TimeInForce(" << static_cast<int>(tif) << ")";
+    }
+
+    inline void PrintTo(const NewOrder& c, std::ostream* os) {
+        *os << "NewOrder{seq=" << c.seq.value << " id=" << c.id.value
+            << " side=" << (c.side == Side::Buy ? "Buy" : "Sell") << " tif=";
+        PrintTo(c.tif, os);
+        *os << " price=" << c.price.value << " qty=" << c.qty.value << "}";
+    }
+
+    inline void PrintTo(const Cancel& c, std::ostream* os) {
+        *os << "Cancel{seq=" << c.seq.value << " id=" << c.id.value << "}";
+    }
+
+    inline void PrintTo(const Modify& c, std::ostream* os) {
+        *os << "Modify{seq=" << c.seq.value << " id=" << c.id.value
+            << " side=" << (c.side == Side::Buy ? "Buy" : "Sell")
+            << " new_price=" << c.new_price.value << " new_qty=" << c.new_quantity.value << "}";
+    }
 }
 
 namespace lob::test {
