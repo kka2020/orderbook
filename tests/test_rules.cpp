@@ -1,5 +1,10 @@
+#include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -695,6 +700,178 @@ namespace lob::test {
         EXPECT_EQ(fills[2], (Trade{.qty = Quantity{1}, .seq = hit, .maker_id = OrderId{40}, .taker_id = OrderId{60}, .price = Price{105}}));
         EXPECT_EQ(fills[3], (Trade{.qty = Quantity{1}, .seq = hit, .maker_id = OrderId{50}, .taker_id = OrderId{60}, .price = Price{105}}));
         EXPECT_EQ(this->book.best_ask(), std::nullopt);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+    }
+
+    // ---- Queue links: removing an order from anywhere in a level ----
+    //
+    // A linked queue (std::list, or v2 step 3's links stored inside the orders) removes an order by
+    // re-pointing its neighbours at each other. Front, back, middle and only-order removals are
+    // different cases, and so are removal by cancel and removal by a fill. Each test below
+    // finishes by filling the level away, so the trade order shows exactly what the queue holds.
+
+    // Maker ids of the trades, in emission order.
+    inline std::vector<OrderId> makers_of(const std::vector<Trade>& trades) {
+        std::vector<OrderId> out;
+        for (const Trade& t : trades) {
+            out.push_back(t.maker_id);
+        }
+        return out;
+    }
+
+    // Every ordered choice of 0..5 orders to cancel from a five-order level (326 cases), then a
+    // new order joins, then a market order fills the level away. The queue must be exactly the
+    // survivors in arrival order followed by the newcomer, and depth must match it throughout.
+    TYPED_TEST(RulesTest, EveryWayOfCancellingFromALevelKeepsTheRestInArrivalOrder) {
+        constexpr std::size_t n = 5;
+        std::array<std::size_t, n> order {0, 1, 2, 3, 4};
+        auto id_of = [](std::size_t i) { return OrderId{10 * (i + 1)}; };  // 10, 20, ..., 50
+        auto qty_of = [](std::size_t i) { return Quantity{static_cast<std::uint32_t>(i + 1)}; };       // distinct, so depth is checked too
+
+        do {
+            for (std::size_t k = 0; k <= n; ++k) {
+                // Cancel order[0..k). Skip permutations that only reorder the uncancelled tail,
+                // so each ordered choice runs once.
+                if (!std::is_sorted(order.begin() + static_cast<std::ptrdiff_t>(k), order.end())) {
+                    continue;
+                }
+
+                RecordingListener listener;
+                TypeParam book {listener};
+                std::uint64_t seq = 1;
+                auto send = [&](auto command) {
+                    command.seq = SeqNo{seq++};
+                    book.apply(command);
+                };
+
+                std::string trace = "cancelled (by index, in order):";
+                for (std::size_t j = 0; j < k; ++j) {
+                    trace += " " + std::to_string(order[j]);
+                }
+                SCOPED_TRACE(trace);
+
+                for (std::size_t i = 0; i < n; ++i) {
+                    send(sell(id_of(i), Price{100}, qty_of(i)));
+                }
+                std::array<bool, n> cancelled {};
+                for (std::size_t j = 0; j < k; ++j) {
+                    send(cancel(id_of(order[j])));
+                    cancelled[order[j]] = true;
+                }
+
+                std::vector<OrderId> expected;
+                std::uint64_t depth = 0;
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (!cancelled[i]) {
+                        expected.push_back(id_of(i));
+                        depth += qty_of(i).value;
+                    }
+                }
+                ASSERT_EQ(book.depth_at(Price{100}, Side::Sell), depth);
+                ASSERT_EQ(book.best_ask(), k == n ? std::nullopt : std::optional{Price{100}});
+
+                // A newcomer must join at the back, whatever was removed before it.
+                send(sell(OrderId{60}, Price{100}, Quantity{10}));
+                expected.push_back(OrderId{60});
+                ASSERT_EQ(book.depth_at(Price{100}, Side::Sell), depth + 10);
+
+                listener.events.clear();
+                send(market_buy(OrderId{70}, Quantity{1000}));
+                std::vector<Trade> trades;
+                for (const Event& e : listener.events) {
+                    if (const auto* t = std::get_if<Trade>(&e)) {
+                        trades.push_back(*t);
+                    }
+                }
+                EXPECT_EQ(makers_of(trades), expected);
+                EXPECT_EQ(book.best_ask(), std::nullopt);
+                EXPECT_EQ(book.depth_at(Price{100}, Side::Sell), 0u);
+            }
+        } while (std::next_permutation(order.begin(), order.end()));
+    }
+
+    // A fill removes the front order a different way from a cancel. The order behind it must then
+    // be the new front for a cancel, and a newcomer must still join at the back.
+    TYPED_TEST(RulesTest, AfterAFillRemovesTheFrontTheNextOrderIsTheFront) {
+        this->send(sell(OrderId{10}, Price{100}, Quantity{2}));
+        this->send(sell(OrderId{20}, Price{100}, Quantity{3}));
+        this->send(sell(OrderId{30}, Price{100}, Quantity{4}));
+        this->send(buy(OrderId{40}, Price{100}, Quantity{2}));  // fills 10 exactly
+        this->send(cancel(OrderId{20}));                         // now the front
+        this->send(sell(OrderId{50}, Price{100}, Quantity{5}));
+
+        EXPECT_EQ(this->book.depth_at(Price{100}, Side::Sell), 9u);
+        this->send(market_buy(OrderId{60}, Quantity{100}));
+        const std::vector<OrderId> expected {OrderId{10}, OrderId{30}, OrderId{50}};
+        EXPECT_EQ(makers_of(this->trades()), expected);
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
+    // A partly filled front stays the front; cancelling the order right behind it must not lose it.
+    TYPED_TEST(RulesTest, CancellingTheOrderBehindAPartlyFilledFrontKeepsTheFront) {
+        this->send(buy(OrderId{10}, Price{100}, Quantity{5}));
+        this->send(buy(OrderId{20}, Price{100}, Quantity{5}));
+        this->send(buy(OrderId{30}, Price{100}, Quantity{5}));
+        this->send(sell(OrderId{40}, Price{100}, Quantity{2}));  // 10 is left with 3
+        this->send(cancel(OrderId{20}));
+
+        EXPECT_EQ(this->book.depth_at(Price{100}, Side::Buy), 8u);
+        const SeqNo hit = this->send(market_sell(OrderId{50}, Quantity{100}));
+        const std::vector<Trade> all = this->trades();
+        ASSERT_EQ(all.size(), 3u);
+        const std::vector<Trade> sweep {all.begin() + 1, all.end()};  // skip 40's partial fill
+        const std::vector<Trade> expected {
+            Trade{.qty = Quantity{3}, .seq = hit, .maker_id = OrderId{10}, .taker_id = OrderId{50}, .price = Price{100}},
+            Trade{.qty = Quantity{5}, .seq = hit, .maker_id = OrderId{30}, .taker_id = OrderId{50}, .price = Price{100}},
+        };
+        EXPECT_EQ(sweep, expected);
+    }
+
+    // The storage of an order cancelled from the middle of one level is handed to an order at
+    // another price. That order must not carry the old neighbours with it: the old level keeps only
+    // its own orders, and the new order is alone at its own level.
+    TYPED_TEST(RulesTest, StorageFreedMidQueueAndReusedAtAnotherPriceKeepsNoOldNeighbours) {
+        this->send(sell(OrderId{10}, Price{100}, Quantity{1}));
+        this->send(sell(OrderId{20}, Price{100}, Quantity{1}));
+        this->send(sell(OrderId{30}, Price{100}, Quantity{1}));
+        this->send(cancel(OrderId{20}));
+        this->send(sell(OrderId{40}, Price{101}, Quantity{7}));  // may reuse 20's storage
+        this->send(sell(OrderId{50}, Price{100}, Quantity{1}));
+
+        EXPECT_EQ(this->book.depth_at(Price{100}, Side::Sell), 3u);
+        EXPECT_EQ(this->book.depth_at(Price{101}, Side::Sell), 7u);
+
+        // Fill only the 100 level: 40 must not be reached through a stale link.
+        this->send(buy(OrderId{60}, Price{100}, Quantity{100}));
+        const std::vector<OrderId> at_100 {OrderId{10}, OrderId{30}, OrderId{50}};
+        EXPECT_EQ(makers_of(this->trades()), at_100);
+        EXPECT_EQ(this->book.best_ask(), Price{101});
+        EXPECT_EQ(this->book.best_bid(), Price{100});  // 60's remainder rests
+
+        // 40 is intact and alone at 101.
+        this->send(market_buy(OrderId{70}, Quantity{100}));
+        ASSERT_EQ(this->trades().size(), 4u);
+        EXPECT_EQ(this->trades().back().maker_id, OrderId{40});
+        EXPECT_EQ(this->trades().back().qty, Quantity{7});
+        EXPECT_EQ(this->book.best_ask(), std::nullopt);
+    }
+
+    // Modify removes the order and adds it again at the back. Doing that from the middle, the front
+    // and the back (where the order is removed and re-added as the back of the same level) must
+    // each leave a well-formed queue.
+    TYPED_TEST(RulesTest, ModifyFromMiddleFrontAndBackEachRequeuesAtTheBack) {
+        this->send(buy(OrderId{10}, Price{100}, Quantity{1}));
+        this->send(buy(OrderId{20}, Price{100}, Quantity{1}));
+        this->send(buy(OrderId{30}, Price{100}, Quantity{1}));
+        this->send(buy(OrderId{40}, Price{100}, Quantity{1}));
+        this->send(modify(OrderId{20}, Side::Buy, Price{100}, Quantity{2}));  // middle: 10 30 40 20
+        this->send(modify(OrderId{10}, Side::Buy, Price{100}, Quantity{3}));  // front:  30 40 20 10
+        this->send(modify(OrderId{10}, Side::Buy, Price{100}, Quantity{4}));  // back:   30 40 20 10
+
+        EXPECT_EQ(this->book.depth_at(Price{100}, Side::Buy), 8u);
+        this->send(market_sell(OrderId{50}, Quantity{100}));
+        const std::vector<OrderId> expected {OrderId{30}, OrderId{40}, OrderId{20}, OrderId{10}};
+        EXPECT_EQ(makers_of(this->trades()), expected);
         EXPECT_EQ(this->book.best_bid(), std::nullopt);
     }
 

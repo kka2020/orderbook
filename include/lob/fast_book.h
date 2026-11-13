@@ -53,12 +53,14 @@ namespace lob {
             std::visit([this](const auto &c) { handle(c); }, command);
         }
     private:
+        using Slot = std::uint32_t;
+        static constexpr Slot kNoSlot {std::numeric_limits<Slot>::max()};
+
         struct Order {
             OrderId id;
             Quantity qty;
+            Slot next {kNoSlot}, prev {kNoSlot};
         };
-
-        using Slot = std::uint32_t;
 
         class Pool {
         public:
@@ -72,11 +74,12 @@ namespace lob {
                 if (!free_list.empty()) {
                     // We can reuse a slot
                     slot = free_list.back();
-                    // LIFO to exploit cache warm
+                    // LIFO to exploit cache warmness of recently freed slots
                     free_list.pop_back();
                     pool[slot] = order;
                 } else {
                     // No more slots available, so expand the pool
+                    // This assert means that kNoSlot can never be handed out as an actual Slot
                     assert(pool.size() < std::numeric_limits<std::uint32_t>::max());
                     slot = static_cast<std::uint32_t>(pool.size());
                     pool.push_back(order);
@@ -92,6 +95,7 @@ namespace lob {
             }
 
             Order& operator[](Slot slot) {
+                assert(slot != kNoSlot);
                 return pool[slot];
             }
         private:
@@ -99,38 +103,74 @@ namespace lob {
             std::vector<Slot> free_list;
         };
 
-        using OrderQueue = std::list<Slot>;
-
         class PooledQueue {
         public:
-            explicit PooledQueue(OrderQueue& queue, Pool& p) : slots(queue), pool(p) {}
+            explicit PooledQueue(Slot& head, Slot& tail, Pool& p) : head_(head), tail_(tail), pool(p) {}
 
             [[nodiscard]] bool empty() const {
-                return slots.empty();
+                return head_ == kNoSlot;
             }
 
             Order& front() {
-                return pool[slots.front()];
+                assert(head_ != kNoSlot);
+                return pool[head_];
+            }
+
+            void push_back(Slot slot) {
+                if (tail_ == kNoSlot) {
+                    // List was empty
+                    head_ = tail_ = slot;
+                } else {
+                    // List was non-empty
+                    pool[tail_].next = slot;
+                    pool[slot].prev = tail_;
+                    tail_ = slot;
+                }
+            }
+
+            void erase(Slot slot) {
+                assert(slot != kNoSlot);
+
+                Order& order {pool[slot]};
+                if (order.prev != kNoSlot) {
+                    // slot != head
+                    Order& prev_order {pool[order.prev]};
+                    prev_order.next = order.next;
+                } else {
+                    // slot == head
+                    head_ = order.next;
+                }
+
+                if (order.next != kNoSlot) {
+                    // slot != tail
+                    Order& next_order {pool[order.next]};
+                    next_order.prev = order.prev;
+                } else {
+                    // slot == tail
+                    tail_ = order.prev;
+                }
+
+                order.next = kNoSlot;
+                order.prev = kNoSlot;
+
+                pool.release(slot);
             }
 
             void pop_front() {
-                Slot slot {slots.front()};
-                pool.release(slot);
-                slots.pop_front();
+                assert(head_ != kNoSlot);
+                erase(head_);
             }
         private:
-            OrderQueue& slots;
+            Slot &head_, &tail_;
             Pool& pool;
         };
         static_assert(MatchPolicyFor<MatchPolicy, PooledQueue>,
              "MatchPolicy must provide static Quantity fill_level(Level&, Quantity, on_fill) for this book's Level");
 
         struct Level {
-            OrderQueue orders;
+            Slot head {kNoSlot}, tail {kNoSlot};
             std::uint64_t total {0};
         };
-
-        using OrderIt = OrderQueue::iterator;
 
         struct OrderIdHash {
             std::size_t operator()(OrderId id) const noexcept {
@@ -141,7 +181,7 @@ namespace lob {
         struct IdTableEntry {
             Side side;
             Price price;
-            OrderIt it;
+            Slot slot;
         };
 
         using IdTable = std::unordered_map<OrderId, IdTableEntry, OrderIdHash>;
@@ -158,17 +198,19 @@ namespace lob {
                 return first_entry->first;
             }
 
-            OrderIt add(Price price, Order order, Pool& p) {
+            Slot add(Price price, Order order, Pool& p) {
                 auto [level_it, _] = levels.try_emplace(price);
 
-                auto& [queue, total] {level_it->second};
+                auto& [head, tail, total] {level_it->second};
 
+                // Add order to level
                 Slot slot {p.allocate(order)};
-                auto order_it = queue.insert(queue.end(), slot);
+                PooledQueue(head, tail, p).push_back(slot);
 
+                // Update level's total
                 total += order.qty.value;
 
-                return order_it;
+                return slot;
             }
 
             [[nodiscard]] std::uint64_t depth_at(Price price) const {
@@ -200,16 +242,17 @@ namespace lob {
 
                         level.total -= fill_qty.value;
 
+                        // If maker is completely filled, remove from id_table
                         if (maker.qty.value == 0) {
                             id_table_ref.erase(maker.id);
                         }
                     };
 
-                    PooledQueue pooled_queue = PooledQueue(level.orders, p);
+                    PooledQueue pooled_queue = PooledQueue(level.head, level.tail, p);
                     remaining_qty = MatchPolicy::fill_level(pooled_queue, remaining_qty, on_fill);
 
                     // If level is now empty, delete it
-                    if (level.orders.empty()) {
+                    if (level.head == kNoSlot) {
                         levels.erase(level_it);
                     }
                 }
@@ -217,19 +260,20 @@ namespace lob {
                 return remaining_qty;
             }
 
-            void cancel_order(Price price, OrderIt it, Pool& p) {
-                // PRE: levels.contains(price) && it is valid
+            void cancel_order(Price price, Slot slot, Pool& p) {
+                assert(levels.contains(price));
                 auto level_it {levels.find(price)};
                 auto& level {level_it->second};
 
-                // Reduce level.total before iterator is deleted
-                level.total -= p[*it].qty.value;
+                Order& order {p[slot]};
 
-                // Release slot before deleting list node
-                p.release(*it);
-                level.orders.erase(it);
+                // Reduce level.total before slot is
+                level.total -= order.qty.value;
 
-                if (level.orders.empty()) {
+                // Remove slot from list
+                PooledQueue(level.head, level.tail, p).erase(slot);
+
+                if (level.head == kNoSlot) {
                     levels.erase(level_it);
                 }
             }
@@ -296,7 +340,7 @@ namespace lob {
             // Otherwise, we proceed to rest the order
             Order order = {.id = new_order.id, .qty = result.remaining_qty};
 
-            OrderIt order_it {
+            Slot order_slot {
                 new_order.side == Side::Buy ?
                 bids.add(new_order.price, order, pool) :
                 asks.add(new_order.price, order, pool)
@@ -304,7 +348,7 @@ namespace lob {
 
             // Add this order to the id table
             id_table.emplace(new_order.id, IdTableEntry{
-                .side = new_order.side, .price = new_order.price, .it = order_it
+                .side = new_order.side, .price = new_order.price, .slot = order_slot
             });
         }
 
@@ -332,15 +376,15 @@ namespace lob {
         }
 
         Quantity remove_resting(IdTable::iterator id_table_it) {
-            auto [side, price, it] = id_table_it->second;
+            auto [side, price, slot] = id_table_it->second;
             // Read qty now: 'it' is invalid once the order is erased. Returned so the caller can report it
-            Quantity qty {pool[*it].qty};
+            Quantity qty {pool[slot].qty};
 
             // Erase order from the book
             if (side == Side::Buy) {
-                bids.cancel_order(price, it, pool);
+                bids.cancel_order(price, slot, pool);
             } else {
-                asks.cancel_order(price, it, pool);
+                asks.cancel_order(price, slot, pool);
             }
 
             id_table.erase(id_table_it);

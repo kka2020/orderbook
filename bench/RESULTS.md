@@ -157,3 +157,38 @@ tails are now worse than v1 in the same run, consistent with the extra hop on th
 
 For context, v1 also passes the flash1 benchmark on all five scenarios (`flash1/run.sh`), at
 about 9–10 M msgs/s on that workload, which differs from this one.
+
+## v2 step 3: intrusive FIFO in the pool (2026-11-13)
+
+Each pooled order now carries its own queue links (`next`/`prev`, 32-bit slot numbers), and a
+level is just `{head, tail, total}`. The `std::list` of slot numbers is gone, and the id table
+stores the slot directly. Cancel unlinks in O(1) without touching any other allocation.
+
+| | instructions | L1d misses | LL data misses | allocations |
+|---|---:|---:|---:|---:|
+| v1 | 401 | 5.36 | 0.667 | 1.036 |
+| v2 step 2 | 411 | 4.93 | 0.706 | 1.036 |
+| v2 step 3 | **308** | **4.75** | 0.696 | **0.518** |
+
+Allocations per message by kind (v1 in brackets): new 0.952 (1.903), cancel 0 (0),
+modify 1.001 (2.001).
+
+- **Allocations halved.** A resting order no longer needs a list node. The one allocation left
+  is the id table's hash node, which step 4 (a flat id table) targets.
+- **−103 instructions per message (−25%) against step 2, and −93 against v1.** Making and
+  freeing a list node (the allocator's bookkeeping) is gone, along with the extra hop from
+  list node → slot → order.
+- **L1d misses down slightly.** LL misses are unchanged, which is expected: the pool and the
+  map of levels have the same footprint as before.
+
+Latency, 11 interleaved rounds (v1 in the same run in brackets):
+
+| op | p50 ns | p99 ns |
+|---|---:|---:|
+| new | 45 (70) | 119 (187) |
+| cancel | 73 (97) | 201 (225) |
+| modify | 110 (160) | 273 (333) |
+
+Throughput: 16.00 M msgs/s (v1: 11.28 in the same run).
+The cancel and modify tails that regressed in step 2 (cancel p99 262 vs v1 206) are now
+ahead of v1 in the same run (201 vs 225).

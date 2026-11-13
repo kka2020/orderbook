@@ -1,5 +1,5 @@
 // FastBook-only promises that v1 does not make: it can be moved, and the capacity passed to the
-// constructor is a hint, not a limit. (Matching behaviour is covered for both books by
+// constructor is a hint, not a limit (the order pool grows past it, and queues survive the growth). (Matching behaviour is covered for both books by
 // test_rules.cpp and test_differential.cpp.)
 
 #include <cstddef>
@@ -86,6 +86,45 @@ namespace lob::test {
             }
             EXPECT_EQ(acks, n) << "some cancels were rejected: orders were lost while the book grew";
             EXPECT_EQ(book.best_bid(), std::nullopt);
+        }
+
+        // Growing the pool moves every order to new memory. A queue linked by slot numbers survives
+        // that; one linked by pointers or references into the pool would not (ASan reports it in
+        // the debug build). Capacity 1 makes the pool grow on almost every add.
+        TEST(FastBookCapacity, QueueOrderSurvivesPoolGrowth) {
+            RecordingListener listener;
+            V2 book {listener, 1};
+            constexpr std::size_t n = 300;
+            for (std::size_t i = 0; i < n; ++i) {
+                book.apply(sell(OrderId{10 + i}, Price{100}, Quantity{1}));
+            }
+            // Unlink every third order while the pool is at its largest...
+            for (std::size_t i = 0; i < n; i += 3) {
+                book.apply(cancel(OrderId{10 + i}));
+            }
+            // ...then grow it again with orders that land on the back of the same queue.
+            for (std::size_t i = n; i < 2 * n; ++i) {
+                book.apply(sell(OrderId{10 + i}, Price{100}, Quantity{1}));
+            }
+
+            std::vector<OrderId> expected;
+            for (std::size_t i = 0; i < 2 * n; ++i) {
+                if (i >= n || i % 3 != 0) {
+                    expected.push_back(OrderId{10 + i});
+                }
+            }
+            EXPECT_EQ(book.depth_at(Price{100}, Side::Sell), expected.size());
+
+            listener.events.clear();
+            book.apply(market_buy(OrderId{100000}, Quantity{100000}));
+            std::vector<OrderId> makers;
+            for (const Event& e : listener.events) {
+                if (const auto* t = std::get_if<Trade>(&e)) {
+                    makers.push_back(t->maker_id);
+                }
+            }
+            EXPECT_EQ(makers, expected);
+            EXPECT_EQ(book.best_ask(), std::nullopt);
         }
     }
 }
