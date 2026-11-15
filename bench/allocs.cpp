@@ -58,7 +58,7 @@ namespace {
     template <lob::OrderBookLike Book>
     void report(const char* name, const Workload& w) {
         NullListener listener;
-        Book book{listener};
+        Book book {lob::bench::make_book<Book>(listener, w)};
         for (const lob::Command& c : w.prefill) {
             book.apply(c);
         }

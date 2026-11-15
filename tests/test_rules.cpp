@@ -1225,6 +1225,56 @@ namespace lob::test {
         EXPECT_EQ(this->book.best_ask(), Price{60});
     }
 
+    // ---- Order ids: every uint64_t is a valid id ----
+    //
+    // Nothing reserves an id value, so 0 and the maximum must rest, fill, cancel and modify like
+    // any other id. (A hash table that marks empty buckets with a reserved key, often 0, breaks this.)
+
+    TYPED_TEST(RulesTest, IdsAtTheEdgesOfTheRangeRestFillAndCancel) {
+        constexpr OrderId zero {0};
+        constexpr OrderId max {std::numeric_limits<std::uint64_t>::max()};
+        constexpr OrderId max_minus_one {std::numeric_limits<std::uint64_t>::max() - 1};
+
+        this->send(buy(zero, Price{100}, Quantity{5}));
+        this->send(buy(max, Price{100}, Quantity{5}));
+        this->send(buy(max_minus_one, Price{99}, Quantity{5}));
+        EXPECT_TRUE(this->order_rejects().empty()) << "no id is a duplicate of an empty slot";
+
+        // A duplicate of each edge id is still a duplicate.
+        this->send(buy(zero, Price{98}, Quantity{1}));
+        this->send(buy(max, Price{98}, Quantity{1}));
+        ASSERT_EQ(this->order_rejects().size(), 2u);
+        EXPECT_EQ(this->order_rejects()[0].reason, RejectReason::DuplicateId);
+        EXPECT_EQ(this->order_rejects()[1].reason, RejectReason::DuplicateId);
+
+        // Fill id 0 completely (it is first in time at 100), then cancel the max id.
+        const SeqNo hit = this->send(sell(OrderId{10}, Price{100}, Quantity{5}));
+        const SeqNo cxl = this->send(cancel(max));
+        const std::vector<Trade> expected_trades {
+            Trade{.qty = Quantity{5}, .seq = hit, .maker_id = zero, .taker_id = OrderId{10}, .price = Price{100}},
+        };
+        EXPECT_EQ(this->trades(), expected_trades);
+        const std::vector<CancelAck> expected_cancels {
+            CancelAck{.side = Side::Buy, .qty = Quantity{5}, .seq = cxl, .id = max, .price = Price{100}},
+        };
+        EXPECT_EQ(this->cancel_acks(), expected_cancels);
+
+        // Both are gone now; the third edge id is still live and can be modified.
+        this->send(cancel(zero));
+        this->send(cancel(max));
+        EXPECT_EQ(this->cancel_rejects().size(), 2u);
+        this->send(modify(max_minus_one, Side::Buy, Price{97}, Quantity{3}));
+        EXPECT_EQ(this->modify_acks().size(), 1u);
+        EXPECT_EQ(this->book.best_bid(), Price{97});
+        EXPECT_EQ(this->book.depth_at(Price{97}, Side::Buy), 3u);
+
+        // And the freed ids can be used again.
+        this->send(buy(zero, Price{96}, Quantity{1}));
+        this->send(buy(max, Price{96}, Quantity{1}));
+        EXPECT_EQ(this->order_rejects().size(), 2u);
+        EXPECT_EQ(this->book.depth_at(Price{96}, Side::Buy), 2u);
+    }
+
     // ---- depth_at, run once per side ----
 
     template <typename BookT, Side s>

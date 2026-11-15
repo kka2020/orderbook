@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -63,6 +64,9 @@ namespace lob::bench {
         std::size_t rested = 0;     // GTC orders that rested at least briefly
         std::size_t filled = 0;     // ...and later fully filled
         std::size_t cancelled = 0;  // ...and later cancelled (the rest are still resting at the end)
+
+        // The most orders resting at once, prefill included: the capacity a deployment would size for.
+        std::size_t peak_live = 0;
     };
 
     namespace detail {
@@ -129,6 +133,7 @@ namespace lob::bench {
                 w.rested = rested_;
                 w.filled = filled_;
                 w.cancelled = cancelled_;
+                w.peak_live = peak_live_;
                 return w;
             }
 
@@ -143,6 +148,7 @@ namespace lob::bench {
                 ++rested_;
                 pos_[o.id.value] = live_.size();
                 live_.push_back(o);
+                peak_live_ = std::max(peak_live_, live_.size());
             }
 
             // O(1) removal: move the last order into the gap (order within live_ doesn't matter).
@@ -261,7 +267,7 @@ namespace lob::bench {
             std::unordered_map<std::uint64_t, std::size_t> pos_;  // order id -> index in live_
             std::uint64_t next_id_ = 1;
             std::uint64_t next_seq_ = 1;
-            std::size_t rested_ = 0, filled_ = 0, cancelled_ = 0;
+            std::size_t rested_ = 0, filled_ = 0, cancelled_ = 0, peak_live_ = 0;
             FillTracker tracker_;
             BaselineBook<FillTracker> shadow_;  // declared after tracker_, which it references
         };
@@ -274,6 +280,19 @@ namespace lob::bench {
 
     inline Workload make_workload(const WorkloadConfig& cfg) {
         return detail::Generator{cfg}.make();
+    }
+
+    // Builds a book to replay w. A book that takes a capacity hint (FastBook) gets the workload's
+    // peak resting-order count, as a deployment would size it for its expected peak. The hint
+    // matters for a flat table: its memory footprint is set by capacity, not by live entries, so an
+    // oversized table spreads lookups over cold cache lines. Other books get just the listener.
+    template <typename Book, typename Listener>
+    Book make_book(Listener& listener, const Workload& w) {
+        if constexpr (std::is_constructible_v<Book, Listener&, std::size_t>) {
+            return Book{listener, w.peak_live};
+        } else {
+            return Book{listener};
+        }
     }
 
 } // namespace lob::bench

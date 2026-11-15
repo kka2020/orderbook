@@ -192,3 +192,53 @@ Latency, 11 interleaved rounds (v1 in the same run in brackets):
 Throughput: 16.00 M msgs/s (v1: 11.28 in the same run).
 The cancel and modify tails that regressed in step 2 (cancel p99 262 vs v1 206) are now
 ahead of v1 in the same run (201 vs 225).
+
+## v2 step 4: flat open-addressing id table (2026-11-15)
+
+`std::unordered_map` (one heap node per resting order) is replaced by `FlatIdMap`: one array of
+`{id, entry, occupied}` slots, linear probing, maximum load 0.5, power-of-two size, and
+backward-shift deletion (no tombstones). The hash is the splitmix64 finalizer, so ids that
+share low bits (e.g. multiples of 4096) still spread out. The entry was reordered to 16 bytes.
+
+**Capacity hint.** From this step, the benchmarks build FastBook with the workload's peak
+resting-order count (5,067 here; `make_book` in `bench/workload.h`) instead of the default
+65,536. Earlier steps used the default; their structures were insensitive to it, apart from
+step 0's `reserve` (see above). A flat table is not: its footprint is set by capacity, and a
+good hash spreads lookups evenly over all of it.
+
+| | instructions | L1d misses | LL data misses | allocations |
+|---|---:|---:|---:|---:|
+| v1 | 401 | 5.36 | 0.667 | 1.036 |
+| v2 step 3 | 308 | 4.75 | 0.696 | 0.518 |
+| v2 step 4, default capacity (131,072 slots, 4 MB) | 218 | 3.87 | 0.948 | 0.000 |
+| v2 step 4, peak capacity (16,384 slots, 512 KB) | **237** | **4.15** | **0.676** | **0.000** |
+
+Allocations per message by kind (v1 in brackets): new 0.001 (1.903), cancel 0 (0),
+modify 0.001 (2.001). The remaining 0.001 is `std::map` creating a new price level, which
+step 5 targets.
+
+- **No allocation on the hot path.** The hash node was the last per-order allocation.
+- **−71 instructions per message against step 3, −164 against v1.** No allocator call on
+  rest, and a lookup reads one slot instead of bucket → node.
+- **Oversizing the table costs tail latency.** At the default capacity, the table is 4 MB for
+  ~5,000 live orders, so almost every lookup lands on a cold cache line: LL misses rose to
+  0.948 and `new` p99 was ~210 ns, worse than v1. Sized to the peak, LL misses return to
+  step 3's level. It costs 19 more instructions, because probes are longer at load ~0.3 than
+  at ~0.04.
+- **Hash quality is a correctness-of-performance issue.** With `x ^ (x >> 30)` (no
+  multiplies), the map test that inserts 20,000 ids spaced 4,096 apart took 5.2 s in the
+  debug build; with the finalizer, 62 ms. The benchmark's ids are sequential, the best case
+  for a weak hash, so this does not show in the numbers above.
+
+Latency, 11 interleaved rounds, peak capacity (v1 in the same run in brackets; two runs, the
+second shown):
+
+| op | p50 ns | p99 ns |
+|---|---:|---:|
+| new | 39 (49) | 117 (138) |
+| cancel | 38 (68) | 113 (153) |
+| modify | 72 (113) | 185 (241) |
+
+Throughput: 22.17 M msgs/s (v1: 15.61 in the same run). v2 is now at or below v1 on every
+p50 and p99, in both runs. At the default capacity, in a separate run, v2's p99 was new 216,
+cancel 179, modify 218 (v1: 137, 164, 270).

@@ -6,6 +6,7 @@ add_executable(lob_tests
         test_concepts.cpp
         test_differential.cpp
         test_fast_book.cpp
+        test_flat_id_map.cpp
         book_test_support.h)
 target_link_libraries(lob_tests PRIVATE lob::lob lob_warnings GTest::gtest_main)
 # The differential test reuses the benchmark's workload generator (bench/workload.h).

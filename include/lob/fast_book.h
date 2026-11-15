@@ -1,13 +1,11 @@
 #ifndef ORDERBOOK_FAST_BOOK_H
 #define ORDERBOOK_FAST_BOOK_H
 
-#include <list>
 #include <optional>
 #include <map>
 #include <functional>
 #include <algorithm>
 #include <type_traits>
-#include <unordered_map>
 #include <variant>
 #include <cstddef>
 #include <cstdint>
@@ -20,14 +18,14 @@
 #include "types.h"
 #include "commands.h"
 #include "events.h"
+#include "flat_id_map.h"
 
 namespace lob {
     template <EventListener Listener, typename MatchPolicy = FifoPolicy>
     class FastBook {
     public:
-        explicit FastBook(Listener& l, std::size_t capacity = 1 << 16) : listener(l), pool(capacity) {
-            id_table.reserve(capacity);
-        }
+        explicit FastBook(Listener& l, std::size_t capacity = 1 << 16)
+            : listener(l), id_table(capacity), pool(capacity) {}
 
         FastBook(const FastBook&) = delete;
         FastBook& operator=(const FastBook&) = delete;
@@ -172,19 +170,13 @@ namespace lob {
             std::uint64_t total {0};
         };
 
-        struct OrderIdHash {
-            std::size_t operator()(OrderId id) const noexcept {
-                return std::hash<std::uint64_t>{}(id.value);
-            }
-        };
-
         struct IdTableEntry {
-            Side side;
-            Price price;
-            Slot slot;
+            Price price {0};
+            Slot slot {kNoSlot};
+            Side side {Side::Buy};
         };
 
-        using IdTable = std::unordered_map<OrderId, IdTableEntry, OrderIdHash>;
+        using IdTable = FlatIdMap<IdTableEntry>;
 
         template <Side S>
         class BookSide {
@@ -267,7 +259,7 @@ namespace lob {
 
                 Order& order {p[slot]};
 
-                // Reduce level.total before slot is
+                // Reduce level.total before slot is freed
                 level.total -= order.qty.value;
 
                 // Remove slot from list
@@ -347,8 +339,8 @@ namespace lob {
             };
 
             // Add this order to the id table
-            id_table.emplace(new_order.id, IdTableEntry{
-                .side = new_order.side, .price = new_order.price, .slot = order_slot
+            id_table.insert(new_order.id, IdTableEntry{
+                .price = new_order.price, .slot = order_slot, .side = new_order.side,
             });
         }
 
@@ -375,9 +367,9 @@ namespace lob {
             after_match(new_order, result);
         }
 
-        Quantity remove_resting(IdTable::iterator id_table_it) {
-            auto [side, price, slot] = id_table_it->second;
-            // Read qty now: 'it' is invalid once the order is erased. Returned so the caller can report it
+        Quantity remove_resting(OrderId id, IdTableEntry* entry) {
+            auto [price, slot, side] = *entry;
+            // Read qty now: slot is invalid once the order is erased. Returned so the caller can report it
             Quantity qty {pool[slot].qty};
 
             // Erase order from the book
@@ -387,14 +379,14 @@ namespace lob {
                 asks.cancel_order(price, slot, pool);
             }
 
-            id_table.erase(id_table_it);
+            id_table.erase(id);
             return qty;
         }
 
         void handle(const Cancel& cancel) {
             // If the id lookup table doesn't contain the id we're trying to cancel, emit a rejection event and return
-            auto id_table_it = id_table.find(cancel.id);
-            if (id_table_it == id_table.end()) {
+            IdTableEntry* entry = id_table.find(cancel.id);
+            if (!entry) {
                 listener.on(CancelReject{
                     .seq = cancel.seq,
                     .id = cancel.id,
@@ -403,9 +395,9 @@ namespace lob {
             }
 
             // The id is resting. Copy side and price for the CancelAck now, because remove_resting erases the entry
-            auto [side, price, _] = id_table_it->second;
+            auto [price, _, side] = *entry;
 
-            Quantity qty = remove_resting(id_table_it);
+            Quantity qty = remove_resting(cancel.id, entry);
 
             // Emit CancelAck event
             listener.on(CancelAck{
@@ -417,16 +409,16 @@ namespace lob {
             });
         }
 
-        bool rejects_modify(const Modify &modify, IdTable::iterator id_table_it) {
-            return id_table_it == id_table.end() || id_table_it->second.side != modify.side
+        bool rejects_modify(const Modify &modify, IdTableEntry* entry) {
+            return !entry || entry->side != modify.side
                    || modify.new_quantity == Quantity{0} || is_invalid_price(modify.new_price);
         }
 
         void handle(const Modify &modify) {
-            auto id_table_it {id_table.find(modify.id)};
+            IdTableEntry* entry {id_table.find(modify.id)};
 
             // Check if modify request is valid, otherwise emit ModifyReject and early exit
-            if (rejects_modify(modify, id_table_it)) {
+            if (rejects_modify(modify, entry)) {
                 listener.on(ModifyReject{
                     .seq = modify.seq,
                     .id = modify.id,
@@ -435,8 +427,9 @@ namespace lob {
                 return;
             }
 
-            Side side = id_table_it->second.side;
-            remove_resting(id_table_it);
+            // Save side before removing the entry
+            Side side = entry->side;
+            remove_resting(modify.id, entry);
 
             NewOrder new_order {
                 .side = side,

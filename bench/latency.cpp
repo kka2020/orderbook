@@ -159,7 +159,7 @@ namespace {
                 v.resize(w.timed.size());
             }
             CountingListener listener;
-            Book book{listener};
+            Book book {lob::bench::make_book<Book>(listener, w)};
             prefill(book, w);
 
             for (const lob::Command& c : w.timed) {
@@ -190,7 +190,7 @@ namespace {
         // Throughput pass: the whole replay under one timer, no per-op overhead.
         {
             CountingListener listener;
-            Book book{listener};
+            Book book {lob::bench::make_book<Book>(listener, w)};
             prefill(book, w);
             const std::uint64_t a = tsc_start();
             for (const lob::Command& c : w.timed) {
@@ -276,7 +276,7 @@ namespace {
     template <lob::OrderBookLike Book>
     void run_replay_once(const Workload& w) {
         CountingListener listener;
-        Book book{listener};
+        Book book {lob::bench::make_book<Book>(listener, w)};
         prefill(book, w);
         replay_once(book, w);
         std::printf("%s: replayed %zu messages (%llu trades)\n", book_name<Book>(), w.timed.size(),
@@ -326,8 +326,8 @@ int main(int argc, char** argv) {
     const Workload w = lob::bench::make_workload(cfg);
     const std::uint64_t overhead = timer_overhead();
     const double ticks_per_ns = tsc_per_ns();
-    std::printf("TSC %.3f GHz, timer overhead %llu TSC ticks (subtracted). Prefill %zu orders, seed %llu.\n",
-                ticks_per_ns, static_cast<unsigned long long>(overhead), w.prefill.size(),
+    std::printf("TSC %.3f GHz, timer overhead %llu TSC ticks (subtracted). Prefill %zu orders, peak %zu resting (v2 capacity hint), seed %llu.\n",
+                ticks_per_ns, static_cast<unsigned long long>(overhead), w.prefill.size(), w.peak_live,
                 static_cast<unsigned long long>(cfg.seed));
 
     // Interleaved: v1 then v2 in every round, so a slow phase of the machine hits both alike.
