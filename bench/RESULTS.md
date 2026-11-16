@@ -155,8 +155,8 @@ Latency, 11 interleaved rounds (v1 in the same run in brackets):
 Throughput: 14.42 M msgs/s (v1: 11.45 in the same run, a slow run overall). Cancel and modify
 tails are now worse than v1 in the same run, consistent with the extra hop on those paths.
 
-For context, v1 also passes the flash1 benchmark on all five scenarios (`flash1/run.sh`), at
-about 9–10 M msgs/s on that workload, which differs from this one.
+For context, v1 also passes the flash1 benchmark on all five scenarios (`flash1/run.sh`; see the
+flash1 section at the end), at about 7–10 M msgs/s on that workload, which differs from this one.
 
 ## v2 step 3: intrusive FIFO in the pool (2026-11-13)
 
@@ -340,3 +340,28 @@ not against step 4's absolute numbers:
 Throughput against v1 in the same run: default 19.14 vs 13.06 M msgs/s (1.47x; step 4: 1.42x),
 deep 13.14 vs 9.55 (1.38x; step 4: 1.31x). A gain this small is within run-to-run noise in wall
 time; the cachegrind counts above are the reliable measure for it.
+
+## flash1: external correctness check, v1 and v2 (2026-11-16)
+
+`flash1/run.sh` builds the flash1 adapter once per book (`-DLOB_FLASH1_BOOK=1` or `2`, `-O3
+-march=native -DNDEBUG`) and runs the harness on all five scenarios. `perf` checks the SHA-256 of
+the full report stream against the consensus; `audit` checks 192 best bid/ask/depth samples
+against liquibook. (`static` has no audit: liquibook itself exceeds the harness's 120 s alarm on
+that scenario.)
+
+| scenario | v1 M msgs/s | v2 M msgs/s | v2 / v1 | verdict (both books) |
+|---|---:|---:|---:|---|
+| static | 9.92 | 12.85 | 1.30x | VALID (perf) |
+| normal | **7.28** | 10.55 | 1.45x | VALID (perf + audit) |
+| swing-25 | 7.52 | **10.31** | 1.37x | VALID (perf + audit) |
+| swing-40 | 9.68 | 11.63 | 1.20x | VALID (perf + audit) |
+| flash-crash | 9.86 | 11.04 | 1.12x | VALID (perf + audit) |
+
+**Worst-case throughput** (the figure flash1 reports): v1 7.28 M msgs/s (normal), v2 10.31 M
+msgs/s (swing-25), 1.42x. One run per cell, on WSL2: indicative only. v2 also passes `perf` on
+static, normal, swing-40 and flash-crash with its debug `assert`s enabled (no `-DNDEBUG`).
+
+The gap is smaller than on our own workload (1.47x), most likely because each message here also pays for the
+adapter's translation and for pushing every report into the harness's queue, which costs the same
+for both books, so the book is a smaller share of the total. FastBook runs with its default
+capacity hint (65,536), not one sized to these workloads.

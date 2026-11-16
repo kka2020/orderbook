@@ -1,12 +1,14 @@
-// flash1 adapter: exposes lob::BaselineBook through the flash1 matching-engine benchmark's C ABI
+// flash1 adapter: exposes a lob book (v1 BaselineBook or v2 FastBook) through the flash1 matching-engine benchmark's C ABI
 // (api/matching_engine_api.h in https://github.com/flash1-dev/matching-engine-benchmark).
 //
 // The harness dlopen()s the .so built from this file, calls engine_on_* once per message, and checks
 // the report stream we push (SHA-256 against the consensus) plus best bid/ask/depth at random points.
 //
 // This file is translation only: raw C structs -> lob commands, lob events -> me_report_t.
-// All matching happens inside lob::BaselineBook. The global book instance lives here and nowhere else
+// All matching happens inside the book. The global book instance lives here and nowhere else
 // (the C ABI has no handle parameter, so a global is unavoidable at this boundary).
+//
+// The book is chosen at compile time: -DLOB_FLASH1_BOOK=1 for v1, 2 for v2 (flash1/run.sh builds both).
 
 #include <cstdint>
 #include <cstdio>
@@ -17,7 +19,13 @@
 
 #include "matching_engine_api.h"
 
+#if LOB_FLASH1_BOOK == 1
 #include "lob/baseline.h"
+#elif LOB_FLASH1_BOOK == 2
+#include "lob/fast_book.h"
+#else
+#error "define LOB_FLASH1_BOOK as 1 (BaselineBook) or 2 (FastBook)"
+#endif
 
 namespace {
 
@@ -105,12 +113,18 @@ namespace {
         void* sink_;
     };
 
+#if LOB_FLASH1_BOOK == 1
+    using Book = lob::BaselineBook<ReportSink>;
+#else
+    using Book = lob::FastBook<ReportSink>;  // default capacity hint; the book grows past it if needed
+#endif
+
     // engine_init constructs these; engine_shutdown destroys them. The book holds a reference to the
     // sink, so the sink is declared first (constructed first, destroyed last).
     // unique_ptr rather than std::optional for the book: GCC 14 -O3 gives a false-positive
     // -Wmaybe-uninitialized inside optional<BaselineBook>::emplace.
     std::optional<ReportSink> g_sink;
-    std::unique_ptr<lob::BaselineBook<ReportSink>> g_book;
+    std::unique_ptr<Book> g_book;
 
     // seq is the offending message's sequence number, or nullopt for a query (queries have none).
     [[noreturn]] void reject_input(const char* what, unsigned value,
@@ -152,7 +166,7 @@ namespace {
     void init(const me_transport_t* transport, void* report_sink) noexcept {
         g_book.reset();
         g_sink.emplace(transport, report_sink);
-        g_book = std::make_unique<lob::BaselineBook<ReportSink>>(*g_sink);
+        g_book = std::make_unique<Book>(*g_sink);
     }
 
     void apply(const lob::Command& command) noexcept {
@@ -200,7 +214,7 @@ void engine_on_modify(const modify_t* m) {
     });
 }
 
-// BaselineBook matches synchronously on the calling thread, so nothing is ever pending.
+// Both books match synchronously on the calling thread, so nothing is ever pending.
 void engine_flush() {}
 
 // The ABI uses sentinels for an empty side; lob uses std::optional. The mapping lives only here.
