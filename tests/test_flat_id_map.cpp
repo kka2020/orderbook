@@ -9,9 +9,15 @@
 //       Value* find(OrderId id) noexcept;             // nullptr if absent
 //       bool contains(OrderId id) const noexcept;
 //       bool erase(OrderId id) noexcept;              // false if id was absent
+//       void erase(Value* entry) noexcept;            // (step 7) erase the entry find() returned,
+//                                                     // without searching for its id again
 //       std::size_t size() const noexcept;
 //       bool empty() const noexcept;
 //   };
+//
+// erase(Value*) exists so FastBook's cancel and modify, which already hold the pointer from
+// find(), do not probe the table a second time. Precondition: `entry` came from find() on this
+// map, and nothing has been inserted or erased since (both can move entries).
 //
 // Hash is a template parameter so these tests can force collisions: a real hash spreads keys out,
 // so the clustering and wrap-around cases below would otherwise almost never happen. Hash must be
@@ -58,6 +64,23 @@ namespace lob::test {
 
         static_assert(std::is_nothrow_move_constructible_v<FlatIdMap<std::uint64_t>>,
                       "FastBook must stay nothrow-movable, so its id map must be too");
+
+        // The two ways to erase. ByEntry is what FastBook does: find() first, then erase the entry
+        // it returned. Both report whether the id was present, so tests can use either.
+        enum class EraseBy { Id, Entry };
+
+        template <class Map>
+        bool erase_using(Map& map, std::uint64_t id, EraseBy how) {
+            if (how == EraseBy::Id) {
+                return map.erase(OrderId{id});
+            }
+            auto* entry {map.find(OrderId{id})};
+            if (entry == nullptr) {
+                return false;
+            }
+            map.erase(entry);
+            return true;
+        }
 
         // ---- Basic behaviour, with the default hash ----
 
@@ -115,6 +138,33 @@ namespace lob::test {
             EXPECT_TRUE(map.insert(OrderId{10}, 333));
             ASSERT_NE(map.find(OrderId{10}), nullptr);
             EXPECT_EQ(*map.find(OrderId{10}), 333u);
+        }
+
+        TEST(FlatIdMap, ErasingAFoundEntryRemovesOnlyThatId) {
+            FlatIdMap<std::uint64_t> map {16};
+            ASSERT_TRUE(map.insert(OrderId{10}, 111));
+            ASSERT_TRUE(map.insert(OrderId{0}, 100));
+            ASSERT_TRUE(map.insert(OrderId{kMaxId}, 999));
+
+            for (std::uint64_t id : {std::uint64_t{10}, std::uint64_t{0}}) {
+                SCOPED_TRACE(testing::Message() << "erasing " << id);
+                std::uint64_t* entry {map.find(OrderId{id})};
+                ASSERT_NE(entry, nullptr);
+                *entry = 5;  // FastBook edits entries in place before it erases them
+                map.erase(entry);
+                EXPECT_FALSE(map.contains(OrderId{id}));
+                EXPECT_EQ(map.find(OrderId{id}), nullptr);
+                EXPECT_FALSE(map.erase(OrderId{id})) << "the id must really be gone";
+            }
+
+            EXPECT_EQ(map.size(), 1u);
+            ASSERT_NE(map.find(OrderId{kMaxId}), nullptr);
+            EXPECT_EQ(*map.find(OrderId{kMaxId}), 999u);
+
+            EXPECT_TRUE(map.insert(OrderId{10}, 333)) << "an id erased by entry can be inserted again";
+            ASSERT_NE(map.find(OrderId{10}), nullptr);
+            EXPECT_EQ(*map.find(OrderId{10}), 333u);
+            EXPECT_EQ(map.size(), 2u);
         }
 
         // Order ids are any uint64_t: the book accepts 0 and the maximum. An open-addressing table
@@ -211,7 +261,7 @@ namespace lob::test {
         // the probe chain for keys that were placed after it; backward-shift deletion moves them
         // back to close the gap.)
         template <class Hash>
-        void erase_from_one_cluster() {
+        void erase_from_one_cluster(EraseBy how) {
             FlatIdMap<std::uint64_t, Hash> map {64};
             constexpr std::uint64_t n {40};
             std::vector<std::uint64_t> live;
@@ -225,7 +275,7 @@ namespace lob::test {
             for (std::uint64_t victim : {std::uint64_t{0}, n - 1, std::uint64_t{17}, std::uint64_t{18},
                                          std::uint64_t{19}, std::uint64_t{5}}) {
                 SCOPED_TRACE(testing::Message() << "after erasing " << victim);
-                ASSERT_TRUE(map.erase(OrderId{victim}));
+                ASSERT_TRUE(erase_using(map, victim, how));
                 std::erase(live, victim);
                 expect_exactly(map, live, n + 5);
             }
@@ -237,22 +287,36 @@ namespace lob::test {
             }
             expect_exactly(map, live, n + 5);
             for (std::uint64_t id : live) {
-                ASSERT_TRUE(map.erase(OrderId{id})) << "id " << id;
+                ASSERT_TRUE(erase_using(map, id, how)) << "id " << id;
             }
             EXPECT_TRUE(map.empty());
             expect_exactly(map, {}, n + 5);
         }
 
         TEST(FlatIdMapCollisions, EraseInsideASingleCluster) {
-            erase_from_one_cluster<CollideAll>();
+            erase_from_one_cluster<CollideAll>(EraseBy::Id);
         }
 
         TEST(FlatIdMapCollisions, EraseInsideAClusterThatWrapsAroundTheTable) {
-            erase_from_one_cluster<WrapAround>();
+            erase_from_one_cluster<WrapAround>(EraseBy::Id);
         }
 
         TEST(FlatIdMapCollisions, EraseWhereClustersRunIntoEachOther) {
-            erase_from_one_cluster<SevenBuckets>();
+            erase_from_one_cluster<SevenBuckets>(EraseBy::Id);
+        }
+
+        // The same three, erasing through the entry find() returned. The entry may sit anywhere in
+        // the cluster, so erasing it must still close the gap with the backward shift.
+        TEST(FlatIdMapCollisions, EraseByEntryInsideASingleCluster) {
+            erase_from_one_cluster<CollideAll>(EraseBy::Entry);
+        }
+
+        TEST(FlatIdMapCollisions, EraseByEntryInsideAClusterThatWrapsAroundTheTable) {
+            erase_from_one_cluster<WrapAround>(EraseBy::Entry);
+        }
+
+        TEST(FlatIdMapCollisions, EraseByEntryWhereClustersRunIntoEachOther) {
+            erase_from_one_cluster<SevenBuckets>(EraseBy::Entry);
         }
 
         // Growth must re-place every key, including long collision chains.
@@ -272,7 +336,8 @@ namespace lob::test {
         // plus a few ids at the edges of the range. Every result is compared with
         // std::unordered_map, and every 500 operations every id is checked.
         template <class Hash>
-        void churn_against_reference(std::uint64_t seed, int ops, std::size_t capacity) {
+        void churn_against_reference(std::uint64_t seed, int ops, std::size_t capacity,
+                                     bool also_erase_by_entry = false) {
             FlatIdMap<std::uint64_t, Hash> map {capacity};
             std::unordered_map<std::uint64_t, std::uint64_t> reference;
             std::mt19937_64 rng {seed};
@@ -295,7 +360,9 @@ namespace lob::test {
                     ASSERT_EQ(map.insert(OrderId{id}, value), expected) << "insert " << id << " at op " << i;
                 } else if (roll < 8) {
                     const bool expected {reference.erase(id) == 1};
-                    ASSERT_EQ(map.erase(OrderId{id}), expected) << "erase " << id << " at op " << i;
+                    // Draws from rng only when enabled, so the original streams are unchanged.
+                    const EraseBy how {also_erase_by_entry && rng() % 2 == 0 ? EraseBy::Entry : EraseBy::Id};
+                    ASSERT_EQ(erase_using(map, id, how), expected) << "erase " << id << " at op " << i;
                 } else {
                     const auto it {reference.find(id)};
                     const std::uint64_t* value {map.find(OrderId{id})};
@@ -338,6 +405,17 @@ namespace lob::test {
 
         TEST(FlatIdMapChurn, WrapAroundMatchesUnorderedMap) {
             churn_against_reference<WrapAround>(6, 10'000, 16);
+        }
+
+        // Half of all erases go through find() + erase(entry), mixed with erase(id).
+        TEST(FlatIdMapChurn, EraseByEntryMatchesUnorderedMap) {
+            churn_against_reference<OrderIdHash>(7, 100'000, 16, true);
+            churn_against_reference<OrderIdHash>(8, 50'000, 0, true);
+        }
+
+        TEST(FlatIdMapChurn, EraseByEntryWithCollisionsMatchesUnorderedMap) {
+            churn_against_reference<SevenBuckets>(9, 30'000, 16, true);
+            churn_against_reference<WrapAround>(10, 10'000, 16, true);
         }
     }
 }

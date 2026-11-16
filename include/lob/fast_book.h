@@ -190,19 +190,16 @@ namespace lob {
                 return first_entry->first;
             }
 
-            Slot add(Price price, Order order, Pool& p) {
+            void add(Price price, Slot slot, Pool& p) {
                 auto [level_it, _] = levels.try_emplace(price);
 
                 auto& [head, tail, total] {level_it->second};
 
                 // Add order to level
-                Slot slot {p.allocate(order)};
                 PooledQueue(head, tail, p).push_back(slot);
 
                 // Update level's total
-                total += order.qty.value;
-
-                return slot;
+                total += p[slot].qty.value;
             }
 
             [[nodiscard]] std::uint64_t depth_at(Price price) const {
@@ -292,12 +289,28 @@ namespace lob {
             // Price check
             } else if (!is_market(new_order.tif) && is_invalid_price(new_order.price)) {
                 reject_reason.emplace(RejectReason::InvalidPrice);
-            // Duplicate-id check
-            } else if (id_table.contains(new_order.id)) {
-                reject_reason.emplace(RejectReason::DuplicateId);
             }
 
             return reject_reason;
+        }
+
+        Slot claim_id(const NewOrder &new_order) {
+            Slot slot {pool.allocate(Order{
+                .id = new_order.id,
+                .qty = new_order.qty,
+            })};
+
+            bool no_duplicate {id_table.insert(new_order.id, IdTableEntry{
+                .price = new_order.price, .slot = slot, .side = new_order.side
+            })};
+
+            if (!no_duplicate) {
+                // Release slot, since the caller is going to reject new_order
+                pool.release(slot);
+                return kNoSlot;
+            }
+
+            return slot;
         }
 
         MatchResult match(const NewOrder& new_order) {
@@ -311,9 +324,14 @@ namespace lob {
             return MatchResult { .remaining_qty = remaining_qty };
         }
 
-        void after_match(const NewOrder& new_order, MatchResult result) {
-            // If there is not remaining quantity, we don't need to rest an order or cancel
+        void after_match(const NewOrder& new_order, MatchResult result, Slot slot) {
+            // If there is no remaining quantity, we don't rest
+            // => Must remove order from id_table and release slot (if we speculatively allocated)
             if (result.remaining_qty.value == 0) {
+                if (slot != kNoSlot) {
+                    id_table.erase(new_order.id);
+                    pool.release(slot);
+                }
                 return;
             }
 
@@ -326,27 +344,42 @@ namespace lob {
                     .id = new_order.id,
                     .price = new_order.price,
                 });
+                // No need to erase from id_table since we never speculatively inserted
                 return;
             }
 
-            // Otherwise, we proceed to rest the order
-            Order order = {.id = new_order.id, .qty = result.remaining_qty};
+            // Since order is not IOC or Market, it must have been claimed, so slot is valid
+            assert(slot != kNoSlot);
 
-            Slot order_slot {
-                new_order.side == Side::Buy ?
-                bids.add(new_order.price, order, pool) :
-                asks.add(new_order.price, order, pool)
-            };
+            // Update the order's quantity
+            pool[slot].qty = result.remaining_qty;
 
-            // Add this order to the id table
-            id_table.insert(new_order.id, IdTableEntry{
-                .price = new_order.price, .slot = order_slot, .side = new_order.side,
-            });
+            if (new_order.side == Side::Buy) {
+                bids.add(new_order.price, slot, pool);
+            } else {
+                asks.add(new_order.price, slot, pool);
+            }
         }
 
         void handle(const NewOrder& new_order) {
+            std::optional<RejectReason> reject_reason {validate(new_order)};
+            Slot slot {kNoSlot};
+            if (!reject_reason) {
+                bool has_duplicate {};
+                if (rests(new_order.tif)) {
+                    slot = claim_id(new_order);
+                    has_duplicate = slot == kNoSlot;
+                } else {
+                    has_duplicate = id_table.contains(new_order.id);
+                }
+
+                if (has_duplicate) {
+                    reject_reason.emplace(RejectReason::DuplicateId);
+                }
+            }
+
             // If the order isn't valid, emit OrderReject with the stored rejection reason and early return
-            if (std::optional<RejectReason> reject_reason {validate(new_order)}) {
+            if (reject_reason) {
                 listener.on(OrderReject{
                     .reason = *reject_reason,
                     .seq = new_order.seq,
@@ -364,10 +397,10 @@ namespace lob {
             });
 
             MatchResult result = match(new_order);
-            after_match(new_order, result);
+            after_match(new_order, result, slot);
         }
 
-        Quantity remove_resting(OrderId id, IdTableEntry* entry) {
+        Quantity remove_resting(IdTableEntry* entry) {
             auto [price, slot, side] = *entry;
             // Read qty now: slot is invalid once the order is erased. Returned so the caller can report it
             Quantity qty {pool[slot].qty};
@@ -379,7 +412,7 @@ namespace lob {
                 asks.cancel_order(price, slot, pool);
             }
 
-            id_table.erase(id);
+            id_table.erase(entry);
             return qty;
         }
 
@@ -397,7 +430,7 @@ namespace lob {
             // The id is resting. Copy side and price for the CancelAck now, because remove_resting erases the entry
             auto [price, _, side] = *entry;
 
-            Quantity qty = remove_resting(cancel.id, entry);
+            Quantity qty = remove_resting(entry);
 
             // Emit CancelAck event
             listener.on(CancelAck{
@@ -429,7 +462,7 @@ namespace lob {
 
             // Save side before removing the entry
             Side side = entry->side;
-            remove_resting(modify.id, entry);
+            remove_resting(entry);
 
             NewOrder new_order {
                 .side = side,
@@ -440,8 +473,12 @@ namespace lob {
                 .price = modify.new_price,
             };
 
+            Slot slot {claim_id(new_order)};
+
             MatchResult result {match(new_order)};
-            after_match(new_order, result);
+            // slot must be valid since we just removed modify.id in remove_resting()
+            assert(slot != kNoSlot);
+            after_match(new_order, result, slot);
 
             listener.on(ModifyAck{
                 .side = side,

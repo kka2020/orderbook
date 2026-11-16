@@ -69,6 +69,19 @@ namespace lob {
             return true;
         }
 
+        void erase(Value* entry) noexcept {
+            // PRE: Value* entry comes from find, with no insert or erase since
+            std::size_t idx {
+                static_cast<std::size_t>(
+                    reinterpret_cast<const char*>(entry) - reinterpret_cast<const char*>(table_.data())
+                ) / sizeof(FlatIdMapEntry)
+            };
+            assert(&table_[idx].value == entry);
+
+            backwards_shift(idx);
+            size_--;
+        }
+
         [[nodiscard]] std::size_t size() const noexcept {
             return size_;
         }

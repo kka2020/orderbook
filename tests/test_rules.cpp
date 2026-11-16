@@ -1277,6 +1277,106 @@ namespace lob::test {
         EXPECT_EQ(this->book.depth_at(Price{96}, Side::Buy), 2u);
     }
 
+    // ---- Order ids: an id belongs to an order only while that order rests ----
+    //
+    // v2 step 6 claims a new order's id in the id table before matching, instead of checking for a
+    // duplicate first and inserting after. These pin down what must not change: an order that is
+    // rejected, or that never rests, must leave its id free, and a claimed entry must survive the
+    // id-table changes that matching makes (every fully filled maker's id is erased mid-match).
+
+    TYPED_TEST(RulesTest, AnOrderRejectedForQuantityOrPriceLeavesItsIdFree) {
+        this->send(buy(OrderId{10}, Price{50}, Quantity{0}));           // zero quantity
+        this->send(sell(OrderId{11}, max_price, Quantity{5}));         // invalid price
+        ASSERT_EQ(this->order_rejects().size(), 2u);
+
+        // The same ids, now valid: accepted, rest, and can be cancelled.
+        this->send(buy(OrderId{10}, Price{50}, Quantity{4}));
+        this->send(sell(OrderId{11}, Price{60}, Quantity{6}));
+        EXPECT_EQ(this->order_rejects().size(), 2u) << "a rejected order must not keep its id";
+        const SeqNo c10 = this->send(cancel(OrderId{10}));
+        const SeqNo c11 = this->send(cancel(OrderId{11}));
+        const std::vector<CancelAck> expected {
+            CancelAck{.side = Side::Buy, .qty = Quantity{4}, .seq = c10, .id = OrderId{10}, .price = Price{50}},
+            CancelAck{.side = Side::Sell, .qty = Quantity{6}, .seq = c11, .id = OrderId{11}, .price = Price{60}},
+        };
+        EXPECT_EQ(this->cancel_acks(), expected);
+    }
+
+    // Every way a new order can end without resting: filled in full, IOC with a remainder, IOC that
+    // does not cross, market with a remainder, market into an empty side.
+    TYPED_TEST(RulesTest, IdsOfOrdersThatNeverRestAreFreeAgain) {
+        this->send(sell(OrderId{1}, Price{50}, Quantity{5}));
+        this->send(buy(OrderId{20}, Price{50}, Quantity{5}));          // fills in full
+        this->send(sell(OrderId{2}, Price{50}, Quantity{3}));
+        this->send(ioc_buy(OrderId{21}, Price{50}, Quantity{5}));      // fills 3, cancels 2
+        this->send(ioc_buy(OrderId{22}, Price{40}, Quantity{5}));      // no asks: cancelled in full
+        this->send(sell(OrderId{3}, Price{60}, Quantity{2}));
+        this->send(market_buy(OrderId{23}, Quantity{5}));              // fills 2, cancels 3
+        this->send(market_sell(OrderId{24}, Quantity{5}));             // no bids: cancelled in full
+        ASSERT_EQ(this->trades().size(), 3u);
+        ASSERT_EQ(this->cancel_acks().size(), 4u);  // the four remainders
+        ASSERT_EQ(this->book.best_bid(), std::nullopt);
+        ASSERT_EQ(this->book.best_ask(), std::nullopt);
+
+        // None of them rests, so none can be cancelled...
+        for (std::uint64_t id = 20; id <= 24; ++id) {
+            this->send(cancel(OrderId{id}));
+        }
+        EXPECT_EQ(this->cancel_rejects().size(), 5u);
+
+        // ...and each id is free for a new order, which rests normally.
+        for (std::uint64_t id = 20; id <= 24; ++id) {
+            this->send(buy(OrderId{id}, Price{static_cast<std::int64_t>(id)}, Quantity{1}));
+        }
+        EXPECT_TRUE(this->order_rejects().empty()) << "an order that never rested must not keep its id";
+        for (std::uint64_t id = 20; id <= 24; ++id) {
+            this->send(cancel(OrderId{id}));
+        }
+        EXPECT_EQ(this->cancel_acks().size(), 9u);
+        EXPECT_EQ(this->cancel_rejects().size(), 5u);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+    }
+
+    // The taker fully fills 200 makers, so 200 ids are erased from the id table while it matches,
+    // then it rests. Its own entry must still say where it rests (side, price) and the remainder.
+    TYPED_TEST(RulesTest, ATakerThatFillsManyMakersBeforeRestingKeepsItsOwnRestingDetails) {
+        for (std::uint64_t k = 1; k <= 200; ++k) {
+            this->send(sell(OrderId{k}, Price{100 + static_cast<std::int64_t>(k % 50)}, Quantity{1}));
+        }
+        this->send(buy(OrderId{1'000}, Price{150}, Quantity{230}));
+        ASSERT_EQ(this->trades().size(), 200u);
+        EXPECT_EQ(this->book.best_bid(), Price{150});
+        EXPECT_EQ(this->book.depth_at(Price{150}, Side::Buy), 30u);
+
+        // Each maker's id is free; the taker's resting remainder is cancellable with its details.
+        this->send(cancel(OrderId{1}));
+        this->send(cancel(OrderId{200}));
+        EXPECT_EQ(this->cancel_rejects().size(), 2u);
+        const SeqNo c = this->send(cancel(OrderId{1'000}));
+        const std::vector<CancelAck> expected {
+            CancelAck{.side = Side::Buy, .qty = Quantity{30}, .seq = c, .id = OrderId{1'000}, .price = Price{150}},
+        };
+        EXPECT_EQ(this->cancel_acks(), expected);
+        EXPECT_EQ(this->book.best_bid(), std::nullopt);
+    }
+
+    // A modify that crosses and fills in full leaves nothing resting, so its id is free.
+    TYPED_TEST(RulesTest, AModifyThatFillsInFullFreesItsIdForANewOrder) {
+        this->send(sell(OrderId{1}, Price{55}, Quantity{5}));
+        this->send(buy(OrderId{10}, Price{50}, Quantity{5}));
+        this->send(modify(OrderId{10}, Side::Buy, Price{55}, Quantity{5}));  // crosses, fills 5
+        ASSERT_EQ(this->trades().size(), 1u);
+        ASSERT_EQ(this->book.best_bid(), std::nullopt);
+
+        this->send(buy(OrderId{10}, Price{45}, Quantity{2}));
+        EXPECT_TRUE(this->order_rejects().empty());
+        const SeqNo c = this->send(cancel(OrderId{10}));
+        const std::vector<CancelAck> expected {
+            CancelAck{.side = Side::Buy, .qty = Quantity{2}, .seq = c, .id = OrderId{10}, .price = Price{45}},
+        };
+        EXPECT_EQ(this->cancel_acks(), expected);
+    }
+
     // ---- depth_at, run once per side ----
 
     template <typename BookT, Side s>

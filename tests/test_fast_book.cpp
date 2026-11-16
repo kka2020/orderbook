@@ -1,6 +1,7 @@
-// FastBook-only promises that v1 does not make: it can be moved, and the capacity passed to the
-// constructor is a hint, not a limit (the order pool grows past it, and queues survive the growth). (Matching behaviour is covered for both books by
-// test_rules.cpp and test_differential.cpp.)
+// FastBook-only promises that v1 does not make: it can be moved, the capacity passed to the
+// constructor is a hint, not a limit (the order pool grows past it, and queues survive the
+// growth), and the id table's own entries stay correct while matching rearranges it. (Matching
+// behaviour is covered for both books by test_rules.cpp and test_differential.cpp.)
 
 #include <cstddef>
 #include <cstdint>
@@ -125,6 +126,35 @@ namespace lob::test {
             }
             EXPECT_EQ(makers, expected);
             EXPECT_EQ(book.best_ask(), std::nullopt);
+        }
+
+        // A small id table (capacity 1) is crowded, so erasing an id often shifts other entries
+        // back to close the gap (backward-shift deletion). Each round, a taker fully fills 100
+        // makers, so 100 ids are erased while it matches, then rests its remainder. From v2 step 6
+        // the taker's id is claimed before matching: its entry must not be written through a
+        // pointer or reference taken before those erases, which may have moved it.
+        TEST(FastBookIdTable, ATakersEntrySurvivesTheErasesMadeWhileItMatches) {
+            RecordingListener listener;
+            V2 book {listener, 1};
+            std::uint64_t next_id {1};
+            for (std::int64_t round = 0; round < 50; ++round) {
+                SCOPED_TRACE(testing::Message() << "round " << round);
+                const Price price {1'000 + round};
+                for (int k = 0; k < 100; ++k) {
+                    book.apply(sell(OrderId{next_id++}, price, Quantity{1}));
+                }
+                const OrderId taker {next_id++};
+                book.apply(buy(taker, price, Quantity{103}));  // fills 100, rests 3
+                ASSERT_EQ(book.best_bid(), price);
+
+                listener.events.clear();
+                book.apply(cancel(taker));
+                const std::vector<Event> expected {
+                    CancelAck{.side = Side::Buy, .qty = Quantity{3}, .seq = SeqNo{1}, .id = taker, .price = price},
+                };
+                ASSERT_EQ(listener.events, expected);
+                ASSERT_EQ(book.best_bid(), std::nullopt);
+            }
         }
     }
 }

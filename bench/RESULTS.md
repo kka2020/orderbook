@@ -292,3 +292,51 @@ The textbook argument for a sorted vector (contiguous, fewer pointer hops) assum
 nodes are cold. Here the hot levels already sit in cache, and the structure's worst case
 (shifting) grows with book depth. A structure that bounds the shift (e.g. a vector near the
 touch and a tree beyond it) would be the next thing to try; it is not part of this plan.
+
+## v2 step 6: one id-table operation per message (2026-11-16)
+
+Two changes, each removing a second hash probe for the same id.
+
+- **New orders claim their id before matching.** A GTC order allocates its pool slot and inserts
+  its id-table entry up front; a failed insert *is* the duplicate check, so validation no longer
+  probes with `contains`. If the order then fills completely, the claim is undone. IOC and
+  market orders never rest, so they keep the `contains` check and claim nothing. Modify claims
+  the new id before matching too, so "no slot" means only "this order never rests".
+- **Cancel and modify erase through the entry they found** (`FlatIdMap::erase(Value*)`), so the
+  backward shift starts at the slot `find` returned instead of probing for the id again.
+
+| | default: instructions | default: L1d misses | deep: instructions | deep: L1d misses |
+|---|---:|---:|---:|---:|
+| v1 | 401 | 5.36 | 472 | 6.76 |
+| v2 step 4 | 237 | 4.15 | 305 | 5.38 |
+| v2 step 6, claim before matching only | 244 | 4.16 | 314 | — |
+| v2 step 6, with clean-ups and erase by entry | **232** | **4.16** | **301** | **5.38** |
+
+LL misses were unchanged (0.676 default, 0.681 deep). Allocations per message: new 0.001,
+cancel 0, modify 0.001.
+
+- **The first version was a regression.** The saved `contains` was worth ~9 instructions per
+  message inside `flat_id_map.h`, but the code added around it cost ~21: `claim_id` was called
+  from two places and not inlined, `std::optional<Slot>` added a flag and branches, and "no slot"
+  meant two different things. Using the existing `kNoSlot` sentinel and claiming in one place
+  for both callers turned −7 into +5.
+- **Fewer instructions, not fewer cache misses.** The second probe always hit the cache line the
+  first had just loaded, so removing it saves computation (hash, compare) but no memory traffic.
+  This is why the miss columns do not move.
+
+Latency, 11 interleaved rounds (v1 in the same run in brackets). This run's machine was slower
+than step 4's (v1 throughput 13.06 vs 15.61 M msgs/s), so compare against v1 in the same run,
+not against step 4's absolute numbers:
+
+| workload, op | p50 ns | p99 ns |
+|---|---:|---:|
+| default, new | 38 (60) | 122 (158) |
+| default, cancel | 51 (82) | 131 (173) |
+| default, modify | 84 (137) | 202 (268) |
+| deep, new | 48 (74) | 186 (235) |
+| deep, cancel | 64 (92) | 211 (268) |
+| deep, modify | 111 (163) | 340 (423) |
+
+Throughput against v1 in the same run: default 19.14 vs 13.06 M msgs/s (1.47x; step 4: 1.42x),
+deep 13.14 vs 9.55 (1.38x; step 4: 1.31x). A gain this small is within run-to-run noise in wall
+time; the cachegrind counts above are the reliable measure for it.
