@@ -20,6 +20,7 @@ add_library(lob INTERFACE
         include/lob/policies.h
         include/lob/fast_book.h
         include/lob/flat_id_map.h
+        include/lob/sorted_levels.h
 )
 add_library(lob::lob ALIAS lob)
 target_include_directories(lob INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
