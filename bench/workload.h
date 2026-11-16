@@ -54,7 +54,21 @@ namespace lob::bench {
         std::uint32_t modify_percent = 5;    // cancels (so 45% cancels by default)
         std::uint32_t aggressive_percent = 3; // new orders priced through the touch (they trade)
         std::uint32_t ioc_percent = 3;       // new orders that are IOC
+
+        // Deep book (off by default): this share of passive new orders is placed uniformly between
+        // 31 and deep_max_ticks from the touch instead of near it, so the book holds many sparse
+        // levels far from the best prices and levels are created and emptied there. When off, no
+        // random numbers are drawn for it, so the default workload is unchanged.
+        std::uint32_t deep_percent = 0;
+        std::int64_t deep_max_ticks = 5'000;
     };
+
+    // The deep-book variant used by `lob_latency --deep` and the differential test.
+    inline WorkloadConfig deep_book_config() {
+        WorkloadConfig cfg;
+        cfg.deep_percent = 20;
+        return cfg;
+    }
 
     struct Workload {
         std::vector<Command> prefill;  // untimed: GTC adds that build the book to target_depth
@@ -67,6 +81,10 @@ namespace lob::bench {
 
         // The most orders resting at once, prefill included: the capacity a deployment would size for.
         std::size_t peak_live = 0;
+
+        // Price levels per side at the end of generation (shadow book), for describing the workload.
+        std::size_t bid_levels = 0;
+        std::size_t ask_levels = 0;
     };
 
     namespace detail {
@@ -134,6 +152,7 @@ namespace lob::bench {
                 w.filled = filled_;
                 w.cancelled = cancelled_;
                 w.peak_live = peak_live_;
+                count_levels(w);
                 return w;
             }
 
@@ -178,6 +197,29 @@ namespace lob::bench {
                 return cancel();
             }
 
+            void count_levels(Workload& w) const {
+                std::vector<std::int64_t> bids, asks;
+                for (const LiveOrder& o : live_) {
+                    (o.side == Side::Buy ? bids : asks).push_back(o.price.value);
+                }
+                for (auto* prices : {&bids, &asks}) {
+                    std::sort(prices->begin(), prices->end());
+                    prices->erase(std::unique(prices->begin(), prices->end()), prices->end());
+                }
+                w.bid_levels = bids.size();
+                w.ask_levels = asks.size();
+            }
+
+            // Deep-book option: with probability deep_percent, a passive order goes 31 to
+            // deep_max_ticks from the touch (uniform). Draws nothing when the option is off.
+            std::int64_t passive_distance() noexcept {
+                if (cfg_.deep_percent > 0 && rng_.chance(cfg_.deep_percent)) {
+                    const auto span = static_cast<std::uint32_t>(cfg_.deep_max_ticks - 30);
+                    return 31 + static_cast<std::int64_t>(rng_.below(span));
+                }
+                return touch_distance();
+            }
+
             // Distance from the touch: 0 with probability 1/2, 1 with 1/4, ... capped at 30 ticks,
             // so resting liquidity clusters near the best prices.
             std::int64_t touch_distance() noexcept {
@@ -192,7 +234,7 @@ namespace lob::bench {
                 const Side side = rng_.chance(50) ? Side::Buy : Side::Sell;
                 const bool aggressive = !passive_only && rng_.chance(cfg_.aggressive_percent);
                 const bool ioc = !passive_only && rng_.chance(cfg_.ioc_percent);
-                const std::int64_t d = touch_distance();
+                const std::int64_t d = aggressive ? touch_distance() : passive_distance();
 
                 // Passive: at or behind our side of the mid, and never through the book's actual
                 // opposite best (the mid drifts, so stale orders can sit beyond it). Aggressive:

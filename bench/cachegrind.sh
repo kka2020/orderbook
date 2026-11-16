@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Deterministic "why" numbers: instructions and simulated cache misses per message.
 #
-#   bench/cachegrind.sh [messages]     default 200,000 (cachegrind runs ~50x slower than native)
+#   bench/cachegrind.sh [messages] [--deep]   default 200,000 (cachegrind runs ~50x slower than native);
+#                                             --deep replays the deep-book workload
 #
 # Runs once per book (v1, then v2), each in its own valgrind process.
 #
@@ -14,6 +15,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/build/release/bench/lob_latency"
 MESSAGES="${1:-200000}"
+DEEP=()
+if [[ "${2:-}" == "--deep" ]]; then
+    DEEP=(--deep)
+fi
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
@@ -21,7 +26,7 @@ cmake --build --preset release --target lob_latency >/dev/null
 
 for BOOK in v1 v2; do
     if ! valgrind --tool=cachegrind --cache-sim=yes --instr-at-start=no \
-            --cachegrind-out-file="$OUT/cg.$BOOK.out" "$BIN" --replay-once "$BOOK" "$MESSAGES" \
+            --cachegrind-out-file="$OUT/cg.$BOOK.out" "$BIN" "${DEEP[@]}" --replay-once "$BOOK" "$MESSAGES" \
             2>"$OUT/valgrind.$BOOK.log"; then
         cat "$OUT/valgrind.$BOOK.log" >&2
         exit 1

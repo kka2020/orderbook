@@ -16,7 +16,7 @@ namespace lob {
             static_assert(sizeof(std::size_t) == 8);
 
             std::size_t z {id.value};
-            // Use splitmix64 finalizer to effectively mi
+            // Use splitmix64 finalizer to effectively mix the bits up
             z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
             z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
             return z ^ (z >> 31);

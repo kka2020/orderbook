@@ -3,6 +3,8 @@
 //   lob_latency [rounds] [messages]          default: 11 rounds, 1,000,000 messages
 //   taskset -c 2 lob_latency                  pin to one CPU (best effort under WSL)
 //   lob_latency --replay-once v1|v2 [messages]  one untimed replay of one book, for cachegrind.sh
+//   lob_latency --deep ...                    either form on the deep-book workload
+//                                             (WorkloadConfig::deep_percent, bench/workload.h)
 //
 // Each round, for each book type in turn (so a slow phase of the machine hits every book alike):
 //   1. latency pass:    fresh book, apply the untimed prefill, then time every timed message
@@ -297,6 +299,11 @@ namespace {
 
 int main(int argc, char** argv) {
     lob::bench::WorkloadConfig cfg;
+    if (argc >= 2 && std::string_view{argv[1]} == "--deep") {
+        cfg = lob::bench::deep_book_config();
+        --argc;
+        ++argv;
+    }
 
     // One book per process: cachegrind's counters cover everything between the markers, so
     // replaying two books in one run would add their counts together.
@@ -329,6 +336,8 @@ int main(int argc, char** argv) {
     std::printf("TSC %.3f GHz, timer overhead %llu TSC ticks (subtracted). Prefill %zu orders, peak %zu resting (v2 capacity hint), seed %llu.\n",
                 ticks_per_ns, static_cast<unsigned long long>(overhead), w.prefill.size(), w.peak_live,
                 static_cast<unsigned long long>(cfg.seed));
+    std::printf("Book at the end: %zu bid levels, %zu ask levels%s.\n", w.bid_levels, w.ask_levels,
+                cfg.deep_percent > 0 ? " (deep-book workload)" : "");
 
     // Interleaved: v1 then v2 in every round, so a slow phase of the machine hits both alike.
     std::vector<RoundResult> v1;

@@ -11,7 +11,8 @@
 //   - adversarial: few ids and a narrow price band, so ids are reused, duplicated and cancelled
 //     after filling, orders cross constantly, and every reject path is hit (zero qty, int64-extreme
 //     prices, duplicate ids, wrong-side and stale modifies), across GTC, IOC and market orders;
-//   - realistic: the benchmark workload (bench/workload.h): a deep book, mostly cancels.
+//   - realistic: the benchmark workload (bench/workload.h): a deep book, mostly cancels; also its
+//     deep-book variant, with many sparse levels far from the touch.
 
 #include <cstddef>
 #include <cstdint>
@@ -80,8 +81,8 @@ namespace lob::test {
             return out;
         }
 
-        std::vector<Command> realistic_stream(std::uint64_t seed, std::size_t count) {
-            bench::WorkloadConfig cfg;
+        std::vector<Command> realistic_stream(std::uint64_t seed, std::size_t count, bool deep = false) {
+            bench::WorkloadConfig cfg {deep ? bench::deep_book_config() : bench::WorkloadConfig{}};
             cfg.seed = seed;
             cfg.messages = count;
             bench::Workload w = bench::make_workload(cfg);
@@ -223,6 +224,14 @@ namespace lob::test {
             using Cand = typename TypeParam::Cand;
             const auto divergence = first_divergence<Ref, Cand>(realistic_stream(42, stream_length), 64);
             EXPECT_EQ(divergence, std::nullopt) << "realistic seed 42";
+        }
+
+        // The deep-book workload: many sparse levels far from the touch, created and emptied there.
+        TYPED_TEST(DifferentialTest, DeepBookStreamMatches) {
+            using Ref = typename TypeParam::Ref;
+            using Cand = typename TypeParam::Cand;
+            const auto divergence = first_divergence<Ref, Cand>(realistic_stream(43, stream_length, true), 64);
+            EXPECT_EQ(divergence, std::nullopt) << "deep-book seed 43";
         }
 
         // The adversarial stream must actually reach the paths it claims to: count each event kind

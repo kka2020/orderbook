@@ -3,7 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <numeric>
 #include <optional>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -1515,5 +1517,51 @@ namespace lob::test {
         this->send(new_order(s, OrderId{30}, Price{100}, Quantity{3}));
 
         EXPECT_EQ(this->book.depth_at(Price{100}, s), 3u);
+    }
+
+    // Many price levels, created in shuffled order and some emptied again by cancels, then swept by
+    // one market order: the levels must be visited best first, each trade at its own level's price.
+    TYPED_TEST(SidedRulesTest, ManyLevelsCreatedInShuffledOrderAreSweptBestFirst) {
+        const Side s = this->side;
+        const Price top {1'000};
+        constexpr std::int64_t kLevels {300};
+        auto maker_id = [](std::int64_t k) { return OrderId{static_cast<std::uint64_t>(1'000 + k)}; };
+        auto maker_qty = [](std::int64_t k) { return Quantity{static_cast<std::uint32_t>(1 + k % 5)}; };
+
+        // One order per level, at k ticks behind the top, in shuffled order.
+        std::vector<std::int64_t> offsets(kLevels);
+        std::iota(offsets.begin(), offsets.end(), std::int64_t{0});
+        std::mt19937_64 rng {11};
+        std::shuffle(offsets.begin(), offsets.end(), rng);
+        for (std::int64_t k : offsets) {
+            this->send(new_order(s, maker_id(k), behind(s, top, k), maker_qty(k)));
+        }
+
+        // Empty every third level again, including the top one.
+        for (std::int64_t k = 0; k < kLevels; k += 3) {
+            this->send(cancel(maker_id(k)));
+        }
+        const std::optional<Price> best {s == Side::Buy ? this->book.best_bid() : this->book.best_ask()};
+        EXPECT_EQ(best, behind(s, top, 1));
+        EXPECT_EQ(this->book.depth_at(behind(s, top, 3), s), 0u);
+        EXPECT_EQ(this->book.depth_at(behind(s, top, 4), s), 5u);
+
+        std::uint32_t total {0};
+        for (std::int64_t k = 0; k < kLevels; ++k) {
+            if (k % 3 != 0) {
+                total += maker_qty(k).value;
+            }
+        }
+        const SeqNo sweep = this->send(new_order(opposite(s), OrderId{1}, Price{0}, Quantity{total}, TimeInForce::Market));
+
+        std::vector<Trade> expected;
+        for (std::int64_t k = 0; k < kLevels; ++k) {
+            if (k % 3 != 0) {
+                expected.push_back(Trade{.qty = maker_qty(k), .seq = sweep, .maker_id = maker_id(k),
+                                         .taker_id = OrderId{1}, .price = behind(s, top, k)});
+            }
+        }
+        EXPECT_EQ(this->trades(), expected);
+        EXPECT_EQ(s == Side::Buy ? this->book.best_bid() : this->book.best_ask(), std::nullopt);
     }
 }
