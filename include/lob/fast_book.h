@@ -19,7 +19,6 @@
 #include "commands.h"
 #include "events.h"
 #include "flat_id_map.h"
-#include "sorted_levels.h"
 
 namespace lob {
     template <EventListener Listener, typename MatchPolicy = FifoPolicy>
@@ -183,11 +182,18 @@ namespace lob {
         class BookSide {
         public:
             [[nodiscard]] std::optional<Price> get_best() const {
-                return levels.empty() ? std::nullopt : std::optional<Price>{levels.best_price()};
+                auto first_entry {levels.begin()};
+                if (first_entry == levels.end()) {
+                    return std::nullopt;
+                }
+
+                return first_entry->first;
             }
 
             Slot add(Price price, Order order, Pool& p) {
-                auto& [head, tail, total] {levels.find_or_insert(price)};
+                auto [level_it, _] = levels.try_emplace(price);
+
+                auto& [head, tail, total] {level_it->second};
 
                 // Add order to level
                 Slot slot {p.allocate(order)};
@@ -200,12 +206,12 @@ namespace lob {
             }
 
             [[nodiscard]] std::uint64_t depth_at(Price price) const {
-                const Level* level {levels.find(price)};
-                if (!level) {
+                auto level_it {levels.find(price)};
+                if (level_it == levels.end()) {
                     return 0;
                 }
 
-                return level->total;
+                return level_it->second.total;
             }
 
             [[nodiscard]] Quantity cross(const NewOrder& taker, Listener& l, IdTable& id_table_ref, Pool& p) {
@@ -214,8 +220,8 @@ namespace lob {
                 // crosses the book if it's not a market order
                 while (!levels.empty() && (is_market(taker.tif) || crosses(taker.price)) && remaining_qty.value > 0) {
                     // We already check that levels is non-empty, so this is safe
-                    Price price {levels.best_price()};
-                    Level& level {levels.best()};
+                    auto level_it {levels.begin()};
+                    auto& [price, level] = *level_it;
 
                     auto on_fill = [&](Order& maker, Quantity fill_qty) {
                         l.on(Trade{
@@ -239,7 +245,7 @@ namespace lob {
 
                     // If level is now empty, delete it
                     if (level.head == kNoSlot) {
-                        levels.pop_best();
+                        levels.erase(level_it);
                     }
                 }
 
@@ -247,8 +253,9 @@ namespace lob {
             }
 
             void cancel_order(Price price, Slot slot, Pool& p) {
-                assert(levels.find(price));
-                Level& level {*levels.find(price)};
+                assert(levels.contains(price));
+                auto level_it {levels.find(price)};
+                auto& level {level_it->second};
 
                 Order& order {p[slot]};
 
@@ -259,7 +266,7 @@ namespace lob {
                 PooledQueue(level.head, level.tail, p).erase(slot);
 
                 if (level.head == kNoSlot) {
-                    levels.erase(price);
+                    levels.erase(level_it);
                 }
             }
         private:
@@ -269,7 +276,7 @@ namespace lob {
             }
 
             using Compare = std::conditional_t<S == Side::Buy, std::greater<Price>, std::less<Price>>;
-            SortedLevels<Level, Compare> levels;
+            std::map<Price, Level, Compare> levels;
         };
 
         struct MatchResult {

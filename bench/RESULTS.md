@@ -242,3 +242,53 @@ second shown):
 Throughput: 22.17 M msgs/s (v1: 15.61 in the same run). v2 is now at or below v1 on every
 p50 and p99, in both runs. At the default capacity, in a separate run, v2's p99 was new 216,
 cancel 179, modify 218 (v1: 137, 164, 270).
+
+## v2 step 5: sorted-vector price levels, measured and reverted (2026-11-16)
+
+Tried in commit feb293d and reverted: each side's `std::map<Price, Level>` replaced by
+`SortedLevels`, one `std::vector` of `{price, level}` sorted worst first, so the best level is
+`back()` and a level emptied by a sweep is a `pop_back`. Lookups binary-search with
+`std::ranges::lower_bound`. FastBook keeps `std::map` levels.
+
+**Deep-book workload.** The default workload holds only ~13 levels per side, so it cannot show
+the cost of shifting a vector. `lob_latency --deep` / `cachegrind.sh 200000 --deep` place 20%
+of passive orders 31-5,000 ticks from the touch (~500 levels per side). A scratch
+microbenchmark of one deep level insert + erase: vector ~410 ns at 1,000 levels and ~6.7 µs at
+10,000, `std::map` ~20-120 ns; one tick behind the best: vector ~2 ns.
+
+| | default: instructions | default: L1d misses | deep: instructions | deep: L1d misses |
+|---|---:|---:|---:|---:|
+| v1 | 401 | 5.36 | 472 | 6.76 |
+| v2 step 4 (`std::map` levels) | **237** | 4.15 | **305** | 5.38 |
+| v2 step 5, binary search | 277 | 4.12 | 743 | 4.64 |
+| v2 step 5, linear scan from the back (scratch) | 250 | 4.12 | 1,090 | 4.59 |
+
+LL misses were unchanged (0.676-0.681) and allocations went from 0.001 to 0.000 per message.
+
+- **Default book: no win.** About 13 levels per side fit in L1 as `std::map` nodes, and the map
+  reaches the best level in O(1) (it caches its leftmost node). The binary searches cost ~60
+  instructions per message, so the vector ran 40 more instructions per message for almost no
+  change in L1 misses.
+- **Deep book: much worse.** `memmove` was 52% of all instructions (~380 per message): every
+  level created or emptied deep in the book shifts every level behind it. L1 misses fell
+  (contiguous storage), but not enough to pay for the copying.
+
+Latency, 11 interleaved rounds (v1 in the same run in brackets):
+
+| workload, op | step 5 p50 ns | step 5 p99 ns | step 4 p50 / p99, earlier run |
+|---|---:|---:|---:|
+| default, new | 41 (49) | 124 (130) | 39 / 117 |
+| default, cancel | 42 (68) | 123 (138) | 38 / 113 |
+| default, modify | 78 (112) | 192 (219) | 72 / 185 |
+| deep, new | 53 (63) | 211 (228) | 52 / 180 |
+| deep, cancel | 58 (79) | 258 (265) | 54 / 181 |
+| deep, modify | 109 (140) | 423 (426) | 102 / 301 |
+
+Throughput against v1 in the same run: default 1.32x (step 4: 1.42x), deep 1.15x (step 4:
+1.31x). The deep-book step 4 baseline (same machine, earlier run): v2 p99.9 new / cancel / modify
+297 / 314 / 512 ns, 14.51 M msgs/s vs v1 11.05.
+
+The textbook argument for a sorted vector (contiguous, fewer pointer hops) assumes the tree's
+nodes are cold. Here the hot levels already sit in cache, and the structure's worst case
+(shifting) grows with book depth. A structure that bounds the shift (e.g. a vector near the
+touch and a tree beyond it) would be the next thing to try; it is not part of this plan.
